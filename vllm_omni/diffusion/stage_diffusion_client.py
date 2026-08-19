@@ -158,6 +158,10 @@ class StageDiffusionClient(StageClientBase):
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
         self.engine_input_source = getattr(metadata, "engine_input_source", [])
+        parallel_config = getattr(metadata.runtime_cfg, "parallel_config", None)
+        self.tensor_parallel_size = int(
+            getattr(parallel_config, "tensor_parallel_size", 1)
+        )
 
     def _connect_transport(self, request_address: str, response_address: str) -> None:
         # Expose the ZMQ addresses on the instance so callers (e.g.
@@ -416,6 +420,46 @@ class StageDiffusionClient(StageClientBase):
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
         """Forward control RPCs to the diffusion subprocess."""
+        execute_all_ranks = self.tensor_parallel_size > 1
+        return await self._rpc_async(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            output_rank=0,
+            exec_all_ranks=execute_all_ranks,
+            collect_rank_status=execute_all_ranks,
+        )
+
+    async def direct_rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        """Forward a control RPC to rank 0 only, without NCCL rank gathering."""
+        return await self._rpc_async(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            output_rank=0,
+            exec_all_ranks=False,
+            collect_rank_status=False,
+        )
+
+    async def _rpc_async(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+        *,
+        output_rank: int,
+        exec_all_ranks: bool,
+        collect_rank_status: bool,
+    ) -> Any:
         if self._engine_dead:
             raise EngineDeadError()
 
@@ -445,12 +489,14 @@ class StageDiffusionClient(StageClientBase):
                     "timeout": timeout,
                     "args": list(args),
                     "kwargs": kwargs,
+                    "output_rank": output_rank,
+                    "exec_all_ranks": exec_all_ranks,
+                    "collect_rank_status": collect_rank_status,
                 }
             )
         )
 
         deadline = time.monotonic() + timeout if timeout else None
-        # Wait for the matching RPC response, buffering result messages.
         try:
             while True:
                 self._drain_responses()
@@ -462,19 +508,14 @@ class StageDiffusionClient(StageClientBase):
                     self._engine_dead = True
                     raise EngineDeadError(
                         f"StageDiffusionProc died while waiting for "
-                        f"collective_rpc '{method}' (exit code {proc.exitcode})"
+                        f"rpc '{method}' (exit code {proc.exitcode})"
                     )
                 if deadline is not None and time.monotonic() > deadline:
-                    raise TimeoutError(f"collective_rpc_async '{method}' timed out after {timeout}s")
-                # Block (async) until data arrives on the ZMQ response
-                # socket or until the timeout expires, then loop back to
-                # drain and check.
+                    raise TimeoutError(f"rpc_async '{method}' timed out after {timeout}s")
                 if deadline is not None:
                     poll_timeout_ms = max(int((deadline - time.monotonic()) * 1000), 0)
                 else:
                     poll_timeout_ms = 100
-                # no exception raised on timeout (capped at 100ms so the
-                # engine-dead check still fires regularly).
                 await self._response_poller.poll(timeout=min(poll_timeout_ms, 100))
         finally:
             self._pending_rpcs.discard(rpc_id)

@@ -104,6 +104,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
+from vllm_omni.model_executor.models.z_image.pipeline import Z_IMAGE_PIPELINE
 
 logger = init_logger(__name__)
 
@@ -166,6 +167,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "soulxsinger_svc": SOULXSINGER_SVC_PIPELINE,
     "soulxsinger_svs": SOULXSINGER_SVS_PIPELINE,
+    "z_image": Z_IMAGE_PIPELINE,
 }
 
 

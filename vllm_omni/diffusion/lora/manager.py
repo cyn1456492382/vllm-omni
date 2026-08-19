@@ -23,6 +23,7 @@ from vllm.lora.utils import (
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
 from vllm_omni.config.lora import LoRAConfig
+from vllm_omni.diffusion.experiment_telemetry import cuda_memory_snapshot, emit_event
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -49,6 +50,7 @@ class DiffusionLoRAManager:
         device: torch.device,
         dtype: torch.dtype,
         max_cached_adapters: int = 1,
+        max_gpu_loras: int = 1,
         lora_path: str | None = None,
         lora_scale: float = 1.0,
     ):
@@ -59,10 +61,15 @@ class DiffusionLoRAManager:
             max_cached_adapters: Maximum number of LoRA adapters to keep in the
                 CPU-side cache (LRU). This mirrors vLLM's `max_cpu_loras` and is
                 exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
+            max_gpu_loras: Number of GPU LoRA slots allocated per supported
+                layer. Slot 0 remains the active inference slot; other slots
+                can be populated for residency measurements.
         """
         self.pipeline = pipeline
         self.device = device
         self.dtype = dtype
+        if max_gpu_loras < 1:
+            raise ValueError("max_gpu_loras must be >= 1")
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -78,9 +85,12 @@ class DiffusionLoRAManager:
 
         # LRU-style cache management
         self.max_cached_adapters = max_cached_adapters  # max_cpu_loras
+        self.max_gpu_loras = max_gpu_loras
         self._registered_adapters: dict[int, LoRAModel] = {}  # adapter_id -> LoRAModel
         self._active_adapter_id: int | None = None
         self._adapter_scales: dict[int, float] = {}  # adapter_id -> external scale
+        self._gpu_slot_adapters: dict[int, int] = {}
+        self._gpu_slot_access_order: OrderedDict[int, float] = OrderedDict()
 
         # LRU cache tracking (adapter_id -> last_used_time)
         self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
@@ -94,10 +104,12 @@ class DiffusionLoRAManager:
         self._max_lora_rank: int = 0
 
         logger.info(
-            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
+            "Initializing DiffusionLoRAManager: device=%s, dtype=%s, "
+            "max_cached_adapters=%d, max_gpu_loras=%d, static_lora_path=%s",
             device,
             dtype,
             max_cached_adapters,
+            max_gpu_loras,
             lora_path,
         )
 
@@ -217,12 +229,33 @@ class DiffusionLoRAManager:
             lora_request: The LoRA request, or None to deactivate all adapters.
             lora_scale: The external scale for the LoRA adapter.
         """
+        resident_before = sorted(self._registered_adapters)
+        active_before = self._active_adapter_id
+        start_ns = time.monotonic_ns()
         if lora_request is None:
             if self._active_adapter_id is None:
                 logger.debug("No lora_request provided and adapters are already inactive")
+                emit_event(
+                    "lora_events",
+                    "lora_cache_deactivate_noop",
+                    resident_before=resident_before,
+                    resident_after=resident_before,
+                    active_before=active_before,
+                    active_after=self._active_adapter_id,
+                )
                 return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
+            emit_event(
+                "lora_events",
+                "lora_cache_deactivate",
+                resident_before=resident_before,
+                resident_after=sorted(self._registered_adapters),
+                active_before=active_before,
+                active_after=self._active_adapter_id,
+                elapsed_ms=(time.monotonic_ns() - start_ns) / 1_000_000,
+                hbm=cuda_memory_snapshot(self.device),
+            )
             return
         elif math.isclose(0.0, lora_scale):
             if self._active_adapter_id is None:
@@ -242,7 +275,8 @@ class DiffusionLoRAManager:
             len(self._registered_adapters),
             self.max_cached_adapters,
         )
-        if adapter_id not in self._registered_adapters:
+        cache_hit = adapter_id in self._registered_adapters
+        if not cache_hit:
             logger.info("Loading new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
             # Add the adapter + add to the cache
             self.add_adapter(lora_request)
@@ -251,6 +285,22 @@ class DiffusionLoRAManager:
             self._touch_adapter_info(adapter_id)
 
         self._activate_adapter(adapter_id, lora_scale)
+        resident_after = sorted(self._registered_adapters)
+        emit_event(
+            "lora_events",
+            "lora_cache_hit" if cache_hit else "lora_cache_miss_load",
+            adapter_id=int(adapter_id),
+            adapter_name=str(lora_request.lora_name),
+            adapter_path=str(lora_request.lora_path),
+            lora_scale=float(lora_scale),
+            resident_before=resident_before,
+            resident_after=resident_after,
+            evicted_adapter_ids=sorted(set(resident_before) - set(resident_after)),
+            active_before=active_before,
+            active_after=self._active_adapter_id,
+            elapsed_ms=(time.monotonic_ns() - start_ns) / 1_000_000,
+            hbm=cuda_memory_snapshot(self.device),
+        )
 
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
@@ -360,7 +410,7 @@ class DiffusionLoRAManager:
         # dummy lora config
         lora_config = LoRAConfig(
             max_lora_rank=self._max_lora_rank,
-            max_loras=1,
+            max_loras=self.max_gpu_loras,
             max_cpu_loras=self.max_cached_adapters,
             lora_dtype=self.dtype,
             fully_sharded_loras=False,
@@ -424,7 +474,7 @@ class DiffusionLoRAManager:
             for module_name, full_module_name, module, packed_modules_list in pending_replacements:
                 lora_layer = from_layer_diffusion(
                     layer=module,
-                    max_loras=1,
+                    max_loras=self.max_gpu_loras,
                     lora_config=lora_config,
                     packed_modules_list=packed_modules_list,
                     model_config=None,
@@ -432,6 +482,10 @@ class DiffusionLoRAManager:
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
                     replace_submodule(component, module_name, lora_layer)
+                    # Stamp full name for edge-owned DiT LoRA residual routing.
+                    object.__setattr__(
+                        lora_layer, "_edge_dit_lora_module_name", full_module_name
+                    )
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
@@ -455,7 +509,7 @@ class DiffusionLoRAManager:
 
         lora_config = LoRAConfig(
             max_lora_rank=self._max_lora_rank,
-            max_loras=1,
+            max_loras=self.max_gpu_loras,
             max_cpu_loras=self.max_cached_adapters,
             lora_dtype=self.dtype,
             fully_sharded_loras=False,
@@ -463,7 +517,11 @@ class DiffusionLoRAManager:
 
         # Recreate per-layer buffers with the new maximum rank.
         for lora_layer in self._lora_modules.values():
-            lora_layer.create_lora_weights(max_loras=1, lora_config=lora_config, model_config=None)
+            lora_layer.create_lora_weights(
+                max_loras=self.max_gpu_loras,
+                lora_config=lora_config,
+                model_config=None,
+            )
 
         # Re-apply active adapter if needed (buffers were reset).
         if self._active_adapter_id is not None:
@@ -515,15 +573,24 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
-    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
-        if self._is_active_at_scale(adapter_id, scale):
-            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
-            return
+    def _load_adapter_into_gpu_slot(
+        self,
+        adapter_id: int,
+        slot_index: int,
+        scale: float,
+    ) -> None:
+        """Copy one registered adapter's weights into a GPU LoRA slot."""
+        if adapter_id not in self._registered_adapters:
+            raise ValueError(f"Adapter {adapter_id} is not registered")
+        if slot_index < 0 or slot_index >= self.max_gpu_loras:
+            raise ValueError(
+                f"GPU LoRA slot {slot_index} is outside [0, {self.max_gpu_loras})"
+            )
 
-        logger.info("Activating adapter: id=%d", adapter_id)
         lora_model = self._registered_adapters[adapter_id]
 
-        # activate weights in each LoRA layer
+        # Populate one slot in each LoRA layer. The diffusion forward path
+        # intentionally continues to use slot 0 for normal request execution.
         for full_module_name, lora_layer in self._lora_modules.items():
             lora_weights = self._get_lora_weights(lora_model, full_module_name)
 
@@ -533,7 +600,7 @@ class DiffusionLoRAManager:
                     prefix, _, packed_suffix = full_module_name.rpartition(".")
                     sub_suffixes = self._get_packed_sublayer_suffixes(packed_suffix, n_slices)
                     if sub_suffixes is None:
-                        lora_layer.reset_lora(0)
+                        lora_layer.reset_lora(slot_index)
                         continue
 
                     sub_loras: list[LoRALayerWeights | None] = []
@@ -549,7 +616,7 @@ class DiffusionLoRAManager:
                         sub_loras.append(sub_lora if isinstance(sub_lora, LoRALayerWeights) else None)
 
                     if not any_found:
-                        lora_layer.reset_lora(0)
+                        lora_layer.reset_lora(slot_index)
                         continue
 
                     lora_a_list: list[torch.Tensor | None] = []
@@ -562,7 +629,11 @@ class DiffusionLoRAManager:
                         lora_a_list.append(sub_lora.lora_a)
                         lora_b_list.append(sub_lora.lora_b * scale)
 
-                    lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    lora_layer.set_lora(
+                        index=slot_index,
+                        lora_a=lora_a_list,
+                        lora_b=lora_b_list,
+                    )
                     logger.debug(
                         "Activated packed LoRA for %s via submodules=%s (scale=%.2f)",
                         full_module_name,
@@ -570,7 +641,7 @@ class DiffusionLoRAManager:
                         scale,
                     )
                 else:
-                    lora_layer.reset_lora(0)
+                    lora_layer.reset_lora(slot_index)
                 continue
 
             # Packed LoRA weights already provide per-slice tensors.
@@ -580,7 +651,11 @@ class DiffusionLoRAManager:
                     None if b is None else b * scale  # type: ignore[operator]
                     for b in lora_weights.lora_b
                 ]
-                lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                lora_layer.set_lora(
+                    index=slot_index,
+                    lora_a=lora_a_list,
+                    lora_b=lora_b_list,
+                )
                 logger.debug(
                     "Activated packed LoRA for %s (scale=%.2f)",
                     full_module_name,
@@ -593,7 +668,7 @@ class DiffusionLoRAManager:
             if n_slices > 1:
                 output_slices = getattr(lora_layer, "output_slices", None)
                 if output_slices is None:
-                    lora_layer.reset_lora(0)
+                    lora_layer.reset_lora(slot_index)
                     continue
 
                 total = sum(output_slices)
@@ -604,13 +679,17 @@ class DiffusionLoRAManager:
                         lora_weights.lora_b.shape[0],
                         total,
                     )
-                    lora_layer.reset_lora(0)
+                    lora_layer.reset_lora(slot_index)
                     continue
 
                 b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
-                lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                lora_layer.set_lora(
+                    index=slot_index,
+                    lora_a=lora_a_list,
+                    lora_b=lora_b_list,
+                )
                 logger.debug(
                     "Activated fused LoRA for packed layer %s (scale=%.2f)",
                     full_module_name,
@@ -619,7 +698,11 @@ class DiffusionLoRAManager:
                 continue
 
             scaled_lora_b = lora_weights.lora_b * scale
-            lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
+            lora_layer.set_lora(
+                index=slot_index,
+                lora_a=lora_weights.lora_a,
+                lora_b=scaled_lora_b,
+            )
             logger.debug(
                 "Activated LoRA for %s: lora_a shape=%s, lora_b shape=%s, scale=%.2f",
                 full_module_name,
@@ -628,10 +711,188 @@ class DiffusionLoRAManager:
                 scale,
             )
 
+        self._gpu_slot_adapters[slot_index] = adapter_id
+        self._touch_gpu_slot(slot_index)
+
+    def _touch_gpu_slot(self, slot_index: int) -> None:
+        """Mark one populated GPU LoRA slot as recently used."""
+        self._gpu_slot_access_order[slot_index] = time.monotonic()
+        self._gpu_slot_access_order.move_to_end(slot_index)
+
+    def _swap_adapter_into_gpu_slot(
+        self,
+        adapter_id: int,
+        scale: float,
+        protected_adapter_ids: set[int],
+    ) -> int:
+        """Load a registered adapter into a free or LRU evictable GPU slot."""
+        free_slots = [
+            slot_index
+            for slot_index in range(self.max_gpu_loras)
+            if slot_index not in self._gpu_slot_adapters
+        ]
+        if free_slots:
+            slot_index = free_slots[0]
+            evicted_adapter_id = None
+        else:
+            candidates = [
+                slot_index
+                for slot_index in self._gpu_slot_access_order
+                if self._gpu_slot_adapters.get(slot_index)
+                not in protected_adapter_ids
+                and self._gpu_slot_adapters.get(slot_index)
+                != self._active_adapter_id
+            ]
+            if not candidates:
+                raise ValueError(
+                    "no evictable GPU LoRA slot remains for the scheduled "
+                    f"adapter {adapter_id}; active working set exceeds "
+                    "available GPU LoRA slots"
+                )
+            slot_index = candidates[0]
+            evicted_adapter_id = self._gpu_slot_adapters[slot_index]
+            emit_event(
+                "lora_events",
+                "lora_gpu_slot_swap_out",
+                adapter_id=evicted_adapter_id,
+                slot_index=slot_index,
+                replacement_adapter_id=adapter_id,
+                hbm=cuda_memory_snapshot(self.device),
+            )
+
+        start_ns = time.monotonic_ns()
+        self._load_adapter_into_gpu_slot(adapter_id, slot_index, scale)
+        emit_event(
+            "lora_events",
+            "lora_gpu_slot_swap_in",
+            adapter_id=adapter_id,
+            slot_index=slot_index,
+            evicted_adapter_id=evicted_adapter_id,
+            elapsed_ms=(time.monotonic_ns() - start_ns) / 1_000_000,
+            resident_gpu_slots=self.list_gpu_resident_slots(),
+            hbm=cuda_memory_snapshot(self.device),
+        )
+        return slot_index
+
+    def _set_lora_batch_slot_indices(
+        self, slot_indices: tuple[int | None, ...]
+    ) -> None:
+        for lora_layer in self._lora_modules.values():
+            lora_layer.set_batch_slot_indices(slot_indices)
+
+    def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        if self._is_active_at_scale(adapter_id, scale):
+            self._set_lora_batch_slot_indices((0,))
+            logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
+            return
+
+        logger.info("Activating adapter: id=%d", adapter_id)
+        self._load_adapter_into_gpu_slot(adapter_id, slot_index=0, scale=scale)
         self._active_adapter_id = adapter_id
         self._update_adapter_scale(adapter_id, scale)
+        self._set_lora_batch_slot_indices((0,))
+
+    def preload_adapter_to_gpu_slot(
+        self,
+        adapter_id: int,
+        slot_index: int,
+        scale: float = 1.0,
+    ) -> dict[str, object]:
+        """Populate a non-active GPU slot and return its measured residency."""
+        start_ns = time.monotonic_ns()
+        self._load_adapter_into_gpu_slot(adapter_id, slot_index, scale)
+        snapshot = cuda_memory_snapshot(self.device)
+        payload: dict[str, object] = {
+            "adapter_id": adapter_id,
+            "slot_index": slot_index,
+            "resident_gpu_slots": self.list_gpu_resident_slots(),
+            "elapsed_ms": (time.monotonic_ns() - start_ns) / 1_000_000,
+            "hbm": snapshot,
+        }
+        emit_event("lora_events", "lora_gpu_slot_preload", **payload)
+        return payload
+
+    def set_batch_adapter_mapping(
+        self,
+        entries: list[tuple[LoRARequest | None, float]],
+        request_ids: list[str],
+    ) -> dict[str, object]:
+        """Select one preloaded GPU LoRA slot for each scheduled request."""
+        if len(entries) != len(request_ids):
+            raise ValueError("LoRA entries and request IDs must have equal length")
+
+        requested_scales: dict[int, float] = {}
+        for lora_request, scale in entries:
+            if lora_request is None or math.isclose(scale, 0.0):
+                continue
+            adapter_id = int(lora_request.lora_int_id)
+            previous_scale = requested_scales.setdefault(adapter_id, scale)
+            if not math.isclose(previous_scale, scale):
+                raise ValueError(
+                    f"Adapter {adapter_id} has conflicting scales in one batch"
+                )
+        if len(requested_scales) > self.max_gpu_loras:
+            raise ValueError(
+                "scheduled distinct LoRA adapters exceed GPU LoRA slots: "
+                f"{len(requested_scales)} > {self.max_gpu_loras}"
+            )
+
+        protected_adapter_ids = set(requested_scales)
+        adapter_to_slot: dict[int, int] = {}
+        for adapter_id, scale in requested_scales.items():
+            slot_index = next(
+                (
+                    index
+                    for index, resident_id in self._gpu_slot_adapters.items()
+                    if resident_id == adapter_id
+                ),
+                None,
+            )
+            if slot_index is None:
+                slot_index = self._swap_adapter_into_gpu_slot(
+                    adapter_id,
+                    scale,
+                    protected_adapter_ids,
+                )
+            adapter_to_slot[adapter_id] = slot_index
+            self._touch_adapter_info(adapter_id)
+            self._touch_gpu_slot(slot_index)
+
+        slot_indices: list[int | None] = []
+        adapter_ids: list[int | None] = []
+        for lora_request, scale in entries:
+            if lora_request is None or math.isclose(scale, 0.0):
+                slot_indices.append(None)
+                adapter_ids.append(None)
+                continue
+            adapter_id = int(lora_request.lora_int_id)
+            if adapter_id not in self._registered_adapters:
+                raise ValueError(f"Adapter {adapter_id} is not registered")
+            slot_index = adapter_to_slot[adapter_id]
+            slot_indices.append(slot_index)
+            adapter_ids.append(adapter_id)
+
+        mapping = tuple(slot_indices)
+        for lora_layer in self._lora_modules.values():
+            lora_layer.set_batch_slot_indices(mapping)
+
+        payload = {
+            "request_ids": list(request_ids),
+            "adapter_ids": adapter_ids,
+            "slot_indices": slot_indices,
+            "unique_adapter_ids": sorted(
+                {adapter_id for adapter_id in adapter_ids if adapter_id is not None}
+            ),
+            "unique_slot_indices": sorted(
+                {slot for slot in slot_indices if slot is not None}
+            ),
+            "hbm": cuda_memory_snapshot(self.device),
+        }
+        emit_event("lora_events", "lora_batch_mapping", **payload)
+        return payload
 
     def _deactivate_all_adapters(self) -> None:
+        self._set_lora_batch_slot_indices((None,))
         if self._active_adapter_id is None:
             logger.debug("All adapters already inactive")
             return
@@ -669,9 +930,21 @@ class DiffusionLoRAManager:
         Add a new adapter to the cache without activating it.
         """
         adapter_id = lora_request.lora_int_id
+        resident_before = sorted(self._registered_adapters)
+        start_ns = time.monotonic_ns()
 
         if adapter_id in self._registered_adapters:
             logger.debug("Adapter %d already registered, skipping", adapter_id)
+            emit_event(
+                "lora_events",
+                "lora_cache_add_hit",
+                adapter_id=adapter_id,
+                adapter_name=lora_request.lora_name,
+                adapter_path=lora_request.lora_path,
+                resident_before=resident_before,
+                resident_after=resident_before,
+                hbm=cuda_memory_snapshot(self.device),
+            )
             return False
 
         logger.info("Adding new adapter: id=%d, name=%s", adapter_id, lora_request.lora_name)
@@ -690,6 +963,17 @@ class DiffusionLoRAManager:
         logger.debug(
             "Adapter %d added, cache size: %d/%d", adapter_id, len(self._registered_adapters), self.max_cached_adapters
         )
+        emit_event(
+            "lora_events",
+            "lora_cache_add",
+            adapter_id=adapter_id,
+            adapter_name=lora_request.lora_name,
+            adapter_path=lora_request.lora_path,
+            resident_before=resident_before,
+            resident_after=sorted(self._registered_adapters),
+            elapsed_ms=(time.monotonic_ns() - start_ns) / 1_000_000,
+            hbm=cuda_memory_snapshot(self.device),
+        )
         return True
 
     def remove_adapter(self, adapter_id: int) -> bool:
@@ -703,6 +987,17 @@ class DiffusionLoRAManager:
         logger.info("Removing adapter: id=%d", adapter_id)
         if self._active_adapter_id == adapter_id:
             self._deactivate_all_adapters()
+
+        slots_to_reset = [
+            slot_index
+            for slot_index, resident_adapter_id in self._gpu_slot_adapters.items()
+            if resident_adapter_id == adapter_id
+        ]
+        for slot_index in slots_to_reset:
+            for lora_layer in self._lora_modules.values():
+                lora_layer.reset_lora(slot_index)
+            self._gpu_slot_adapters.pop(slot_index, None)
+            self._gpu_slot_access_order.pop(slot_index, None)
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)
@@ -719,6 +1014,13 @@ class DiffusionLoRAManager:
     def list_adapters(self) -> list[int]:
         """Return list of registered adapter ids."""
         return list(self._registered_adapters.keys())
+
+    def list_gpu_resident_slots(self) -> list[dict[str, int]]:
+        """Return GPU LoRA slots populated with registered adapter weights."""
+        return [
+            {"slot_index": slot_index, "adapter_id": adapter_id}
+            for slot_index, adapter_id in sorted(self._gpu_slot_adapters.items())
+        ]
 
     def pin_adapter(self, adapter_id: int) -> bool:
         """Mark an adapter as pinned so it will not be evicted."""

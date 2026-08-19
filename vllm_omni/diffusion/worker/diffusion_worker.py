@@ -41,6 +41,7 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
+from vllm_omni.diffusion.experiment_telemetry import cuda_memory_snapshot
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
@@ -385,14 +386,36 @@ class DiffusionWorker:
         """Initialize the LoRA manager for this worker."""
         if self.model_runner.pipeline is None:
             return
+        if getattr(self.od_config, "enable_edge_catalog_lora", False):
+            logger.info("Worker %d: skipping local DiffusionLoRAManager init in edge-catalog mode.", self.rank)
+            return
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.model_runner.pipeline,
             device=self.device,
             dtype=self.od_config.dtype,
             max_cached_adapters=self.od_config.max_cpu_loras,
+            max_gpu_loras=self.od_config.max_gpu_loras,
             lora_path=self.od_config.lora_path,
             lora_scale=self.od_config.lora_scale,
         )
+
+    def get_dit_lora_module_inventory(self) -> dict[str, Any]:
+        """Return inventory reflected from this worker's live pipeline."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        pipeline = getattr(self.model_runner, "pipeline", None)
+        if pipeline is None:
+            return self.model_runner.validate_pipeline_and_get_inventory()
+        from vllm_omni.diffusion.lora.dit_lora_overlap import export_module_inventory
+
+        return export_module_inventory(pipeline)
+
+    def get_dit_lora_overlap_stats(self, reset: bool = False) -> dict[str, Any]:
+        """Return request-scoped overlap statistics from the worker runtime."""
+        try:
+            from vllm_omni.diffusion.lora.dit_lora_overlap import get_overlap_stats
+        except ImportError:
+            return {}
+        return get_overlap_stats(reset=reset)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         """Start or stop profiling for this GPU worker.
@@ -452,6 +475,9 @@ class DiffusionWorker:
                 if req.sampling_params.lora_request is not None:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
+            self._install_edge_dit_lora_runtime(
+                req.sampling_params, getattr(req, "request_id", "req0")
+            )
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
@@ -473,15 +499,23 @@ class DiffusionWorker:
     ) -> BatchRunnerOutput:
         """Batch forward: LoRA activate once, delegate to model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
-        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
-            sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
-            try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
-            except Exception as exc:
-                if sp.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+        entries, request_ids = self._get_scheduler_lora_entries(scheduler_output)
+        if self.lora_manager is not None and entries:
+            if getattr(od_config, "enable_mixed_lora_batch", False):
+                self.lora_manager.set_batch_adapter_mapping(entries, request_ids)
+            else:
+                lora_request, lora_scale = entries[0]
+                try:
+                    self.lora_manager.set_active_adapter(lora_request, lora_scale)
+                except Exception as exc:
+                    if lora_request is not None:
+                        raise
+                    logger.warning("LoRA activation skipped: %s", exc)
+            for new_req in scheduler_output.scheduled_new_reqs:
+                self._install_edge_dit_lora_runtime(
+                    new_req.req.sampling_params,
+                    getattr(new_req, "request_id", "req0"),
+                )
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
         with ctx:
@@ -511,8 +545,19 @@ class DiffusionWorker:
         homogeneity is enforced by the scheduler via ``StepBatchSamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
+        if scheduler_output.finished_req_ids:
+            try:
+                from vllm_omni.diffusion.lora.edge_dit_lora_runtime import (
+                    remove_edge_dit_lora_runtime_request,
+                )
+            except Exception:  # pragma: no cover
+                remove_edge_dit_lora_runtime_request = None
+        else:
+            remove_edge_dit_lora_runtime_request = None
         for request_id in scheduler_output.finished_req_ids:
             self._step_lora_state.pop(request_id, None)
+            if remove_edge_dit_lora_runtime_request is not None:
+                remove_edge_dit_lora_runtime_request(request_id)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
@@ -524,20 +569,62 @@ class DiffusionWorker:
         if self.lora_manager is None:
             return
 
+        entries, request_ids = self._get_scheduler_lora_entries(scheduler_output)
         lora_request: LoRARequest | None = None
         lora_scale = 1.0
-        for request_id in scheduler_output.scheduled_request_ids:
-            entry = self._step_lora_state.get(request_id)
-            if entry is not None:
+        for entry in entries:
+            if entry[0] is not None:
                 lora_request, lora_scale = entry
                 break
 
         try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            if getattr(self.od_config, "enable_mixed_lora_batch", False):
+                self.lora_manager.set_batch_adapter_mapping(entries, request_ids)
+            else:
+                self.lora_manager.set_active_adapter(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise
             logger.warning("LoRA activation skipped: %s", exc)
+
+        # Install one edge policy per newly scheduled request. Cached requests
+        # retain the provider installed when they first entered stepwise mode.
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self._install_edge_dit_lora_runtime(
+                new_req.req.sampling_params, new_req.request_id
+            )
+
+    def _get_scheduler_lora_entries(
+        self, scheduler_output: DiffusionSchedulerOutput
+    ) -> tuple[list[tuple[LoRARequest | None, float]], list[str]]:
+        """Resolve LoRA requests for newly scheduled and cached request IDs."""
+        for request_id in scheduler_output.finished_req_ids:
+            self._step_lora_state.pop(request_id, None)
+        for new_req in scheduler_output.scheduled_new_reqs:
+            sampling = new_req.req.sampling_params
+            self._step_lora_state[new_req.request_id] = (
+                sampling.lora_request,
+                sampling.lora_scale,
+            )
+        request_ids = list(scheduler_output.scheduled_request_ids)
+        entries = [
+            self._step_lora_state.get(request_id, (None, 1.0))
+            for request_id in request_ids
+        ]
+        return entries, request_ids
+
+    def _install_edge_dit_lora_runtime(
+        self, sampling_params: Any, request_id: str = "req0"
+    ) -> None:
+        """Best-effort install of edge DiT LoRA runtime from sampling extra_args."""
+        try:
+            from vllm_omni.diffusion.lora.edge_dit_lora_runtime import (
+                install_edge_dit_lora_runtime_from_sampling,
+            )
+
+            install_edge_dit_lora_runtime_from_sampling(sampling_params, request_id)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("edge DiT LoRA runtime install skipped: %s", exc)
 
     def remove_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.remove_adapter(adapter_id)
@@ -561,6 +648,33 @@ class DiffusionWorker:
 
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
+
+    def preload_lora_to_gpu_slot(
+        self,
+        adapter_id: int,
+        slot_index: int,
+        scale: float = 1.0,
+    ) -> dict[str, object]:
+        """Populate one measured GPU-resident LoRA slot."""
+        return self.lora_manager.preload_adapter_to_gpu_slot(
+            adapter_id,
+            slot_index,
+            scale,
+        )
+
+    def list_gpu_lora_slots(self) -> list[dict[str, int]]:
+        """Return the worker's populated GPU LoRA slots."""
+        return self.lora_manager.list_gpu_resident_slots()
+
+    def get_cuda_memory_snapshot(
+        self, reset_peak_memory_stats: bool = False
+    ) -> dict[str, int | None]:
+        """Capture allocator state and optionally start a new peak interval."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+            if reset_peak_memory_stats:
+                torch.cuda.reset_peak_memory_stats(self.device)
+        return cuda_memory_snapshot(self.device)
 
     def sleep(self, level: int = 1) -> int:
         """

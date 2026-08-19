@@ -747,6 +747,31 @@ def test_omni_generate_diffusion_only_yields_single_image_per_request(monkeypatc
     assert engine.shutdown_called is True
 
 
+def test_omni_generate_submits_per_request_sampling_params(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    first = SamplingParams(max_tokens=3)
+    second = SamplingParams(max_tokens=7)
+    engine = FakeAsyncOmniEngine(
+        stage_metadata=DIFFUSION_ONLY_META,
+        default_sampling_params_list=[first],
+        on_add_request=_enqueue_async_diffusion_only_output,
+    )
+    _patch_engine(monkeypatch, engine)
+
+    app = Omni("dummy-model")
+    outputs = app.generate(
+        ["p1", "p2"],
+        first,
+        use_tqdm=False,
+        per_request_sampling_params=[[first], [second]],
+    )
+
+    assert len(outputs) == 2
+    assert engine.submitted[0]["sampling_params_list"][0].max_tokens == 3
+    assert engine.submitted[1]["sampling_params_list"][0].max_tokens == 7
+
+
 def test_omni_generate_llm_diffusion_yields_final_text_then_image_per_request(
     monkeypatch: pytest.MonkeyPatch,
 ):

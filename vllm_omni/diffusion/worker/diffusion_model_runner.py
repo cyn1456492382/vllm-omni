@@ -11,9 +11,11 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import json
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -30,7 +32,17 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.experiment_telemetry import (
+    cuda_memory_snapshot,
+    emit_event,
+    tensor_metadata,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.lora.dit_lora_overlap import (
+    active_overlap_runtime,
+    export_module_inventory,
+    set_overlap_granularity,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsPromptUpdate, supports_prompt_update, supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
@@ -210,6 +222,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             od_config=self.od_config,
             device=self.device,
         )
+        set_overlap_granularity(getattr(self.od_config, "dit_lora_overlap_granularity", 0))
 
         load_device = (
             "cpu"
@@ -245,6 +258,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             time_after_load - time_before_load,
         )
         logger.info("Model runner: Model loaded successfully.")
+
+        if self.pipeline is None:
+            raise RuntimeError("Diffusion model runner did not create a pipeline instance.")
+        pipeline_name = type(self.pipeline).__name__
+        transformer_name = type(getattr(self.pipeline, "transformer", object())).__name__
+        assert pipeline_name == "ZImagePipeline", f"Expected ZImagePipeline, got {pipeline_name}"
+        assert transformer_name == "ZImageTransformer2DModel", f"Expected ZImageTransformer2DModel, got {transformer_name}"
+
+        inventory = export_module_inventory(self.pipeline)
+        if not inventory:
+            raise RuntimeError("Pipeline inventory export returned empty result.")
+        runtime = active_overlap_runtime()
+        runtime.module_inventory = inventory
+        inventory_path = getattr(self.od_config, "dit_lora_inventory_path", None)
+        if inventory_path:
+            from vllm_omni.diffusion.lora.dit_lora_overlap import save_module_inventory
+
+            save_module_inventory(inventory_path, inventory)
+            logger.info("Model runner: wrote module inventory to %s", inventory_path)
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -318,7 +350,64 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 model_tag=self.od_config.model_class_name,
             )
 
+        from vllm_omni.diffusion.lora.dit_lora_overlap import configure_overlap_runtime
+
+        configure_overlap_runtime(
+            enabled=bool(getattr(self.od_config, "dit_lora_enable_profiling", False)),
+            granularity=int(getattr(self.od_config, "dit_lora_overlap_granularity", 0)),
+        )
+        inventory = self.validate_pipeline_and_get_inventory()
+        inventory_path = getattr(self.od_config, "dit_lora_inventory_path", None)
+        if inventory_path and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            output_path = Path(inventory_path).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8")
+            logger.info("Wrote runtime module inventory to %s", output_path)
+
         logger.info("Model runner: Initialization complete.")
+
+    def validate_pipeline_and_get_inventory(self) -> dict[str, Any]:
+        """Validate the loaded Z-Image instance and reflect its live modules.
+
+        This deliberately inspects only the instantiated pipeline. It never
+        treats checkpoint file enumeration as evidence that model loading
+        succeeded.
+        """
+        if self.pipeline is None:
+            raise AssertionError("diffusion pipeline is not initialized")
+        pipeline_name = self.pipeline.__class__.__name__
+        transformer = getattr(self.pipeline, "transformer", None)
+        transformer_name = transformer.__class__.__name__ if transformer is not None else None
+        expected_zimage = getattr(self.od_config, "model_class_name", None) == "ZImagePipeline"
+        if expected_zimage or pipeline_name == "ZImagePipeline":
+            assert pipeline_name == "ZImagePipeline", (
+                f"expected ZImagePipeline, got {pipeline_name}"
+            )
+            assert transformer_name == "ZImageTransformer2DModel", (
+                "expected ZImageTransformer2DModel, "
+                f"got {transformer_name}"
+            )
+
+        components: dict[str, list[dict[str, Any]]] = {}
+        for component_name in ("text_encoder", "transformer", "vae"):
+            component = getattr(self.pipeline, component_name, None)
+            assert component is not None, f"pipeline.{component_name} is missing"
+            components[component_name] = [
+                {
+                    "name": name,
+                    "qualified_name": f"{component_name}.{name}" if name else component_name,
+                    "class_name": module.__class__.__name__,
+                }
+                for name, module in component.named_modules()
+            ]
+
+        return {
+            "schema_version": 1,
+            "model": str(self.od_config.model),
+            "pipeline_class": pipeline_name,
+            "transformer_class": transformer_name,
+            "components": components,
+        }
 
     def clear_prompt_embed_cache(self) -> None:
         """Evict all cached text-encoder outputs (e.g. between training epochs).
@@ -708,7 +797,36 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
                 current_omni_platform.reset_peak_memory_stats()
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
+            input_latents = getattr(input_batch, "latents", None)
+            emit_event(
+                "dit_events",
+                "dit_step_start",
+                scheduler_step_id=int(scheduler_output.step_id),
+                request_ids=[state.request_id for state in states],
+                new_request_ids=list(new_request_ids),
+                configured_max_num_seqs=getattr(self.od_config, "max_num_seqs", None),
+                actual_batch_size=(
+                    int(input_latents.shape[0])
+                    if isinstance(input_latents, torch.Tensor) and input_latents.ndim
+                    else 0
+                ),
+                lora_int_ids=[
+                    getattr(state.sampling.lora_request, "lora_int_id", None)
+                    for state in states
+                ],
+                scheduler_active_requests=int(scheduler_output.num_running_reqs),
+                scheduler_waiting_requests=int(scheduler_output.num_waiting_reqs),
+                runner_state_cache_size=len(self.state_cache),
+                latents=tensor_metadata(input_latents, role="dit_input_latents"),
+                hbm=cuda_memory_snapshot(self._target_device),
+            )
             attn_metadata = {}
+            if states:
+                from vllm_omni.diffusion.lora.dit_lora_overlap import runtime as lora_overlap_runtime
+
+                overlap_runtime = lora_overlap_runtime()
+                overlap_runtime.request_id = states[0].request_id
+                overlap_runtime.step_index = int(states[0].step_index)
 
             with set_forward_context(
                 vllm_config=self.vllm_config,
@@ -716,8 +834,62 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 attn_metadata=attn_metadata,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
+                denoise_start_ns = time.monotonic_ns()
+                from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+                    begin_step as begin_lora_breakdown_step,
+                    flush_step as flush_lora_breakdown_step,
+                    maybe_profile_denoise_step,
+                )
+
+                begin_lora_breakdown_step(
+                    scheduler_step_id=int(scheduler_output.step_id),
+                    request_ids=[state.request_id for state in states],
+                    request_step_indices=[
+                        int(state.step_index) for state in states
+                    ],
+                    actual_batch_size=(
+                        int(input_latents.shape[0])
+                        if isinstance(input_latents, torch.Tensor)
+                        and input_latents.ndim
+                        else 0
+                    ),
+                )
+                cuda_start = None
+                cuda_end = None
+                if current_omni_platform.is_available():
+                    cuda_start = torch.cuda.Event(enable_timing=True)
+                    cuda_end = torch.cuda.Event(enable_timing=True)
+                    cuda_start.record()
+                with maybe_profile_denoise_step():
+                    noise_pred = self.pipeline.denoise_step(
+                        input_batch, states=states
+                    )
+                denoise_cuda_event_ms = None
+                if cuda_start is not None and cuda_end is not None:
+                    cuda_end.record()
+                    cuda_end.synchronize()
+                    denoise_cuda_event_ms = float(cuda_start.elapsed_time(cuda_end))
+                lora_breakdown_interval_count = flush_lora_breakdown_step()
                 denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+                emit_event(
+                    "dit_events",
+                    "dit_step_end",
+                    scheduler_step_id=int(scheduler_output.step_id),
+                    request_ids=[state.request_id for state in states],
+                    actual_batch_size=(
+                        int(input_latents.shape[0])
+                        if isinstance(input_latents, torch.Tensor)
+                        and input_latents.ndim
+                        else 0
+                    ),
+                    denoise_elapsed_ms=(time.monotonic_ns() - denoise_start_ns) / 1_000_000,
+                    denoise_cuda_event_ms=denoise_cuda_event_ms,
+                    lora_breakdown_interval_count=(
+                        lora_breakdown_interval_count
+                    ),
+                    noise_pred=tensor_metadata(noise_pred, role="dit_noise_prediction"),
+                    hbm=cuda_memory_snapshot(self._target_device),
+                )
                 for state in states:
                     merge_stage_durations(
                         state,

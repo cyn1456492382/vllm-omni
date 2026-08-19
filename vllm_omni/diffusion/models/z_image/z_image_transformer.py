@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.experiment_telemetry import emit_event
 from vllm_omni.diffusion.layers.norm import RMSNorm
 
 if TYPE_CHECKING:
@@ -317,6 +319,42 @@ class ZImageAttention(nn.Module):
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
 
+    def project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv, _ = self.to_qkv(hidden_states)
+        qkv = _restore_linear_output_shape(qkv, hidden_states)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        return query, key, value
+
+    def compute_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+        dtype = query.dtype
+        query, key = query.to(dtype), key.to(dtype)
+        if attention_mask is not None and attention_mask.ndim == 2:
+            attention_mask = attention_mask[:, None, None, :]
+        hidden_states = self.attn(query, key, value)
+        return hidden_states.flatten(2, 3).to(dtype)
+
+    def project_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        output = self.to_out[0](hidden_states)
+        return _restore_linear_output_shape(output, hidden_states)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -324,45 +362,11 @@ class ZImageAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
-        qkv, _ = self.to_qkv(hidden_states)
-        qkv = _restore_linear_output_shape(qkv, hidden_states)
-        q_size = self.to_qkv.num_heads * self.head_dim
-        kv_size = self.to_qkv.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
-
-        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
-        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
-        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
-
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
-        # Cast to correct dtype
-        dtype = query.dtype
-        query, key = query.to(dtype), key.to(dtype)
-
-        # From [batch, seq_len] to [batch, 1, 1, seq_len] -> broadcast to [batch, heads, seq_len, seq_len]
-        if attention_mask is not None and attention_mask.ndim == 2:
-            attention_mask = attention_mask[:, None, None, :]
-
-        # Compute joint attention
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-            # attn_mask=attention_mask, # we don't support multi prompts now.
+        query, key, value = self.project_qkv(hidden_states)
+        hidden_states = self.compute_attention(
+            query, key, value, attention_mask, cos, sin
         )
-
-        # Reshape back
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(dtype)
-
-        to_out_input = hidden_states
-        hidden_states = self.to_out[0](hidden_states)
-        hidden_states = _restore_linear_output_shape(hidden_states, to_out_input)
-
-        return hidden_states
+        return self.project_output(hidden_states)
 
 
 class FeedForward(nn.Module):
@@ -393,12 +397,23 @@ class FeedForward(nn.Module):
             prefix=_join_prefix(prefix, "w2"),
         )
 
-    def forward(self, x):
+    def project_up(self, x: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w13(x)
-        hidden_states = _restore_linear_output_shape(hidden_states, x)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.w2(hidden_states)
         return _restore_linear_output_shape(hidden_states, x)
+
+    def activate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.act(hidden_states)
+
+    def project_down(
+        self, hidden_states: torch.Tensor, residual_shape: torch.Tensor
+    ) -> torch.Tensor:
+        output = self.w2(hidden_states)
+        return _restore_linear_output_shape(output, residual_shape)
+
+    def forward(self, x):
+        hidden_states = self.project_up(x)
+        hidden_states = self.activate(hidden_states)
+        return self.project_down(hidden_states, x)
 
 
 class ZImageTransformerBlock(nn.Module):
@@ -456,6 +471,59 @@ class ZImageTransformerBlock(nn.Module):
                 ),
             )
 
+    def _forward_submodules(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        adaln_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from vllm_omni.diffusion.lora.dit_lora_overlap import cuda_task
+
+        block_name = f"block_{self.layer_id}"
+        with cuda_task(block_name, "adaln"):
+            if self.modulation:
+                assert adaln_input is not None
+                modulation = self.adaLN_modulation(adaln_input).unsqueeze(1)
+                scale_msa, gate_msa, scale_mlp, gate_mlp = modulation.chunk(4, dim=2)
+                gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
+                scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+                attn_input = self.attention_norm1(x) * scale_msa
+            else:
+                gate_msa = gate_mlp = None
+                scale_mlp = None
+                attn_input = self.attention_norm1(x)
+
+        with cuda_task(block_name, "qkv_proj"):
+            query, key, value = self.attention.project_qkv(attn_input)
+        with cuda_task(block_name, "attn"):
+            attn_out = self.attention.compute_attention(
+                query, key, value, attn_mask, cos, sin
+            )
+        with cuda_task(block_name, "out_proj"):
+            attn_out = self.attention.project_output(attn_out)
+            if gate_msa is not None:
+                x = x + gate_msa * self.attention_norm2(attn_out)
+            else:
+                x = x + self.attention_norm2(attn_out)
+            ffn_input = self.ffn_norm1(x)
+            if scale_mlp is not None:
+                ffn_input = ffn_input * scale_mlp
+
+        with cuda_task(block_name, "ffn_up"):
+            ffn_hidden = self.feed_forward.project_up(ffn_input)
+        with cuda_task(block_name, "ffn_gelu"):
+            # Z-Image uses fused SiLU-and-multiply rather than GELU.
+            ffn_hidden = self.feed_forward.activate(ffn_hidden)
+        with cuda_task(block_name, "ffn_down"):
+            ffn_out = self.feed_forward.project_down(ffn_hidden, ffn_input)
+            if gate_mlp is not None:
+                x = x + gate_mlp * self.ffn_norm2(ffn_out)
+            else:
+                x = x + self.ffn_norm2(ffn_out)
+        return x
+
     def forward(
         self,
         x: torch.Tensor,
@@ -464,13 +532,18 @@ class ZImageTransformerBlock(nn.Module):
         sin: torch.Tensor,
         adaln_input: torch.Tensor | None = None,
     ):
+        from vllm_omni.diffusion.lora.dit_lora_overlap import overlap_granularity
+
+        if overlap_granularity() >= 3:
+            return self._forward_submodules(
+                x, attn_mask, cos, sin, adaln_input
+            )
+
         if self.modulation:
             assert adaln_input is not None
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)
             gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
-
-            # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 attention_mask=attn_mask,
@@ -478,15 +551,10 @@ class ZImageTransformerBlock(nn.Module):
                 sin=sin,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
-
-            # FFN block
             x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
+                self.feed_forward(self.ffn_norm1(x) * scale_mlp)
             )
         else:
-            # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x),
                 attention_mask=attn_mask,
@@ -494,13 +562,7 @@ class ZImageTransformerBlock(nn.Module):
                 sin=sin,
             )
             x = x + self.attention_norm2(attn_out)
-
-            # FFN block
-            x = x + self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x),
-                )
-            )
+            x = x + self.ffn_norm2(self.feed_forward(self.ffn_norm1(x)))
 
         return x
 
@@ -937,6 +999,20 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         bsz = len(x)
         device = x[0].device
+
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        transformer_total_interval = start_interval(
+            "zimage_transformer_forward",
+            module_name="transformer",
+        )
+        pre_noise_interval = start_interval(
+            "zimage_pre_noise_refiner",
+            module_name="transformer",
+        )
         t = t * self.t_scale
         t = self.t_embedder(t)
 
@@ -979,10 +1055,26 @@ class ZImageTransformer2DModel(CachedTransformer):
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
 
-        for layer in self.noise_refiner:
+        finish_interval(pre_noise_interval)
+
+        noise_refiner_interval = start_interval(
+            "zimage_noise_refiner",
+            module_name="transformer.noise_refiner",
+        )
+        for layer_index, layer in enumerate(self.noise_refiner):
+            block_interval = start_interval(
+                "transformer_block",
+                module_name=f"transformer.noise_refiner.{layer_index}",
+            )
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
+            finish_interval(block_interval)
+        finish_interval(noise_refiner_interval)
 
         # cap embed & refine
+        context_prepare_interval = start_interval(
+            "zimage_context_prepare",
+            module_name="transformer",
+        )
         cap_item_seqlens = [len(_) for _ in cap_feats]
         assert all(_ % SEQ_MULTI_OF == 0 for _ in cap_item_seqlens)
         cap_max_item_seqlen = max(cap_item_seqlens)
@@ -1007,25 +1099,128 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(cap_item_seqlens):
             cap_attn_mask[i, :seq_len] = 1
+        finish_interval(context_prepare_interval)
 
-        for layer in self.context_refiner:
+        context_refiner_interval = start_interval(
+            "zimage_context_refiner",
+            module_name="transformer.context_refiner",
+        )
+        for layer_index, layer in enumerate(self.context_refiner):
+            block_interval = start_interval(
+                "transformer_block",
+                module_name=f"transformer.context_refiner.{layer_index}",
+            )
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
+            finish_interval(block_interval)
+        finish_interval(context_refiner_interval)
 
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
+        unified_prepare_interval = start_interval(
+            "zimage_unified_prepare",
+            module_name="transformer.unified_prepare",
+        )
         unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
             x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
         )
+        finish_interval(unified_prepare_interval)
 
-        # Main transformer blocks
-        for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+        # Main transformer blocks. At block granularity the next block's host
+        if os.environ.get("VLLM_OMNI_EXPERIMENT_FLOPS") == "1":
+            ffn_hidden_dim = int(self.dim / 3 * 8)
+
+            def block_core_flops(sequence_length: int, modulation: bool) -> int:
+                dense_flops = (
+                    8 * bsz * sequence_length * self.dim * self.dim
+                    + 6 * bsz * sequence_length * self.dim * ffn_hidden_dim
+                )
+                attention_flops = 4 * bsz * sequence_length * sequence_length * self.dim
+                modulation_flops = 0
+                if modulation:
+                    modulation_flops = (
+                        2
+                        * bsz
+                        * min(self.dim, ADALN_EMBED_DIM)
+                        * 4
+                        * self.dim
+                    )
+                return dense_flops + attention_flops + modulation_flops
+
+            image_core_flops = len(self.noise_refiner) * block_core_flops(
+                x_max_item_seqlen, modulation=True
+            )
+            context_core_flops = len(self.context_refiner) * block_core_flops(
+                cap_max_item_seqlen, modulation=False
+            )
+            main_core_flops = len(self.layers) * block_core_flops(
+                int(unified.shape[1]), modulation=True
+            )
+            emit_event(
+                "dit_events",
+                "dit_transformer_core_flops",
+                actual_batch_size=int(bsz),
+                image_tokens_per_request=int(x_max_item_seqlen),
+                caption_tokens_per_request=int(cap_max_item_seqlen),
+                unified_tokens_per_request=int(unified.shape[1]),
+                noise_refiner_block_count=len(self.noise_refiner),
+                context_refiner_block_count=len(self.context_refiner),
+                main_block_count=len(self.layers),
+                dense_and_attention_core_flops=(
+                    image_core_flops + context_core_flops + main_core_flops
+                ),
+                estimate_scope=(
+                    "Z-Image Transformer blocks: QKV/out/FFN GEMMs, QK and AV "
+                    "attention GEMMs, and AdaLN modulation GEMMs; excludes "
+                    "normalization, activation, softmax, RoPE, VAE, and text encoder"
+                ),
+            )
+
+        # preparation is issued after the current block has queued its kernels;
+        # tensor-producing GPU work remains strictly ordered on the compute stream.
+        from vllm_omni.diffusion.lora.dit_lora_overlap import (
+            cuda_task,
+            host_task,
+            overlap_granularity,
+        )
+
+        granularity = overlap_granularity()
+        main_layers_interval = start_interval(
+            "zimage_main_layers",
+            module_name="transformer.layers",
+        )
+        for layer_index, layer in enumerate(self.layers):
+            block_name = f"block_{layer_index}"
+            block_interval = start_interval(
+                "transformer_block",
+                module_name=f"transformer.layers.{layer_index}",
+            )
+            if granularity == 2:
+                with cuda_task(block_name, "block"):
+                    unified = layer(
+                        unified, unified_attn_mask, unified_cos, unified_sin, adaln_input
+                    )
+                if layer_index + 1 < len(self.layers):
+                    with host_task(f"block_{layer_index + 1}", "prepare"):
+                        next_layer = self.layers[layer_index + 1]
+                        _ = next_layer.layer_id
+            else:
+                unified = layer(
+                    unified, unified_attn_mask, unified_cos, unified_sin, adaln_input
+                )
+            finish_interval(block_interval)
+        finish_interval(main_layers_interval)
 
         # Final layer
+        final_unpatchify_interval = start_interval(
+            "zimage_final_unpatchify",
+            module_name="transformer",
+        )
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
 
         unified = list(unified.unbind(dim=0))
         x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
+        finish_interval(final_unpatchify_interval)
+        finish_interval(transformer_total_interval)
 
         return x, {}
 

@@ -10,6 +10,7 @@ from dataclasses import fields
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.experiment_telemetry import emit_event
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -132,6 +133,23 @@ class BaseScheduler(ABC):
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
             kv_prefetch_job=kv_prefetch_job,
+        )
+        emit_event(
+            "scheduler_events",
+            "scheduler_wave",
+            scheduler=self.__class__.__name__,
+            scheduler_step_id=int(scheduler_output.step_id),
+            configured_max_num_seqs=int(self.max_num_running_reqs),
+            scheduled_request_ids=list(scheduler_output.scheduled_request_ids),
+            scheduled_new_request_ids=[
+                request.request_id for request in scheduler_output.scheduled_new_reqs
+            ],
+            scheduled_cached_request_ids=list(
+                scheduler_output.scheduled_cached_reqs.request_ids
+            ),
+            finished_request_ids=sorted(scheduler_output.finished_req_ids),
+            active_requests=int(scheduler_output.num_running_reqs),
+            waiting_requests=int(scheduler_output.num_waiting_reqs),
         )
 
         # update after schedule
@@ -278,8 +296,13 @@ class BaseScheduler(ABC):
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        lora_int_id = (
+            None
+            if getattr(self.od_config, "enable_mixed_lora_batch", False)
+            else (lora_request.lora_int_id if lora_request is not None else None)
+        )
         return StepBatchSamplingParamsKey(
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_int_id=lora_int_id,
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 

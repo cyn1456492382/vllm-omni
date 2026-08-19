@@ -33,7 +33,11 @@ class RequestScheduler(BaseScheduler):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         key_kwargs = {name: getattr(sampling, name) for name in _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+        key_kwargs["lora_int_id"] = (
+            None
+            if getattr(self.od_config, "enable_mixed_lora_batch", False)
+            else (lora_request.lora_int_id if lora_request is not None else None)
+        )
         return RequestBatchSamplingParamsKey(**key_kwargs)
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:

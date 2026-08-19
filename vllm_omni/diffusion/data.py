@@ -674,6 +674,27 @@ class OmniDiffusionConfig:
     lora_path: str | None = None
     lora_scale: float = 1.0
     max_cpu_loras: int | None = None
+    max_gpu_loras: int | None = None
+    enable_mixed_lora_batch: bool = False
+    enable_edge_catalog_lora: bool = False
+
+    # DiT-LoRA overlap experiment controls. These are intentionally kept on
+    # the diffusion config so deploy YAML, offline Omni, and worker processes
+    # share one source of truth.
+    dit_lora_overlap_granularity: int = 0
+    dit_lora_enable_profiling: bool = False
+    dit_lora_inventory_path: str | None = None
+    dit_lora_task_trace_path: str | None = None
+    dit_lora_runtime_debug: bool = False
+    edge_dit_lora_host: str = "127.0.0.1"
+    edge_dit_lora_port: int = 9260
+    edge_dit_lora_wire_precision: str = "fp16"
+    edge_dit_lora_fail_closed: bool = True
+    edge_dit_lora_prefetch_depth: int = 1
+    edge_dit_lora_async_timeout_s: float = 30.0
+
+    # Startup warmup can be disabled for memory-constrained deployments.
+    skip_startup_warmup: bool = False
 
     output_type: str = "pil"
 
@@ -1023,6 +1044,35 @@ class OmniDiffusionConfig:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
+        if self.max_gpu_loras is None:
+            self.max_gpu_loras = 1
+        elif self.max_gpu_loras < 1:
+            raise ValueError("max_gpu_loras must be >= 1 for diffusion LoRA")
+
+        if self.dit_lora_overlap_granularity < 0 or self.dit_lora_overlap_granularity > 3:
+            raise ValueError("dit_lora_overlap_granularity must be in [0, 3]")
+        if self.edge_dit_lora_port < 1:
+            raise ValueError("edge_dit_lora_port must be positive")
+        if self.edge_dit_lora_prefetch_depth < 1:
+            raise ValueError("edge_dit_lora_prefetch_depth must be >= 1")
+        if self.edge_dit_lora_async_timeout_s <= 0:
+            raise ValueError("edge_dit_lora_async_timeout_s must be > 0")
+
+        self.dit_lora_overlap_granularity = int(self.dit_lora_overlap_granularity)
+        if self.dit_lora_overlap_granularity not in {0, 1, 2, 3}:
+            raise ValueError(
+                "dit_lora_overlap_granularity must be one of {0, 1, 2, 3}, "
+                f"got {self.dit_lora_overlap_granularity}"
+            )
+        if self.edge_dit_lora_port <= 0 or self.edge_dit_lora_port > 65535:
+            raise ValueError(
+                f"edge_dit_lora_port must be in [1, 65535], got {self.edge_dit_lora_port}"
+            )
+        if self.edge_dit_lora_wire_precision not in {"fp16", "bf16", "fp32"}:
+            raise ValueError(
+                "edge_dit_lora_wire_precision must be one of "
+                f"{{'fp16', 'bf16', 'fp32'}}, got {self.edge_dit_lora_wire_precision!r}"
+            )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
             raise ValueError(

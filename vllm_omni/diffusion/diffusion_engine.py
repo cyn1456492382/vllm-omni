@@ -813,6 +813,9 @@ class DiffusionEngine:
                 raise RuntimeError(f"Could not {action} profiler: {e}") from e
 
     def run_startup_warmup(self) -> None:
+        if getattr(self.od_config, "skip_startup_warmup", False):
+            logger.info("Skipping startup warmup per config.")
+            return
         dlo_use_allgather = getattr(self.od_config, "dlo_use_allgather", True)
         # Skip dummy run when AllGather is used with more than 1 rank,
         # because the dummy run sends only 1 request but AllGather requires

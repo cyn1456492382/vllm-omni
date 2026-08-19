@@ -56,6 +56,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[True],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        per_request_sampling_params: Sequence[Sequence[OmniSamplingParams]] | None = None,
     ) -> Generator[OmniRequestOutput, None, None]: ...
 
     @overload
@@ -66,6 +67,7 @@ class Omni(OmniBase):
         *,
         py_generator: Literal[False] = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        per_request_sampling_params: Sequence[Sequence[OmniSamplingParams]] | None = None,
     ) -> list[OmniRequestOutput]: ...
 
     def generate(
@@ -75,6 +77,7 @@ class Omni(OmniBase):
         *,
         py_generator: bool = False,
         use_tqdm: bool | Callable[..., tqdm] = True,
+        per_request_sampling_params: Sequence[Sequence[OmniSamplingParams]] | None = None,
     ) -> Generator[OmniRequestOutput, None, None] | list[OmniRequestOutput]:
         # Expand sampling params for PD disaggregation (user may provide N-1 params)
         if (
@@ -86,8 +89,20 @@ class Omni(OmniBase):
         sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
         try:
             if py_generator:
-                return self._run_generation_with_generator(prompts, sampling_params_list, use_tqdm)
-            return list(self._run_generation(prompts, sampling_params_list, use_tqdm))
+                return self._run_generation_with_generator(
+                    prompts,
+                    sampling_params_list,
+                    use_tqdm,
+                    per_request_sampling_params,
+                )
+            return list(
+                self._run_generation(
+                    prompts,
+                    sampling_params_list,
+                    use_tqdm,
+                    per_request_sampling_params,
+                )
+            )
         except Exception as e:
             logger.exception("[Omni] Failed to run generation: %s", e)
             self.close()
@@ -98,8 +113,14 @@ class Omni(OmniBase):
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        per_request_sampling_params: Sequence[Sequence[OmniSamplingParams]] | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
-        gen = self._run_generation(prompts, sampling_params_list, use_tqdm)
+        gen = self._run_generation(
+            prompts,
+            sampling_params_list,
+            use_tqdm,
+            per_request_sampling_params,
+        )
         try:
             yield from gen
         finally:
@@ -110,6 +131,7 @@ class Omni(OmniBase):
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params_list: Sequence[OmniSamplingParams],
         use_tqdm: bool | Callable[..., tqdm] = True,
+        per_request_sampling_params: Sequence[Sequence[OmniSamplingParams]] | None = None,
     ) -> Generator[OmniRequestOutput, None, None]:
         try:
             sampling_params_list = self._maybe_force_final_only_for_llm_stages(sampling_params_list)
@@ -119,6 +141,24 @@ class Omni(OmniBase):
             else:
                 request_prompts = list(prompts)
 
+            if per_request_sampling_params is not None:
+                if len(per_request_sampling_params) != len(request_prompts):
+                    raise ValueError(
+                        "per_request_sampling_params must contain one entry per prompt"
+                    )
+                per_request_sampling_params = [
+                    self._maybe_force_final_only_for_llm_stages(params)
+                    for params in per_request_sampling_params
+                ]
+                if any(
+                    len(params) != self.num_stages
+                    for params in per_request_sampling_params
+                ):
+                    raise ValueError(
+                        "each per-request sampling params entry must contain "
+                        "one value per stage"
+                    )
+
             if not request_prompts:
                 return
 
@@ -127,7 +167,9 @@ class Omni(OmniBase):
             wall_start_ts = time.time()
             req_final_stage_ids: dict[str, int] = {}
 
-            for req_id, prompt in zip(request_ids, request_prompts):
+            for request_index, (req_id, prompt) in enumerate(
+                zip(request_ids, request_prompts)
+            ):
                 prompt_modalities = prompt.get("modalities", None) if isinstance(prompt, dict) else None
                 final_stage_id = self._compute_final_stage_id(prompt_modalities)
                 final_output_stage_ids = self._compute_final_output_stage_ids(prompt_modalities) or [final_stage_id]
@@ -144,7 +186,11 @@ class Omni(OmniBase):
                 self.request_states[req_id] = req_state
 
                 # PD disaggregation: modify stage-0 (prefill) sampling params per request
-                req_sp_list = list(sampling_params_list)
+                req_sp_list = list(
+                    per_request_sampling_params[request_index]
+                    if per_request_sampling_params is not None
+                    else sampling_params_list
+                )
                 pd_pair = self._get_pd_separation_pair()
                 if pd_pair is not None:
                     p_id = pd_pair[0]

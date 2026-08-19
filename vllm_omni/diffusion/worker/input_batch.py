@@ -13,15 +13,45 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+import os
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.prompt_update import prompt_update_versions
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
+logger = init_logger(__name__)
+_DEBUG_INPUT_BATCH = os.environ.get("ZIMAGE_DEBUG_INPUT_BATCH", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _dbg_type(value: object) -> str:
+    return type(value).__name__ if value is not None else "None"
+
+
+def _dbg_value(value: object) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, torch.Tensor):
+        return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+    if isinstance(value, list):
+        sample = [type(v).__name__ for v in value[:3]]
+        return f"list(len={len(value)}, sample_types={sample})"
+    if isinstance(value, dict):
+        return f"dict(keys={list(value.keys())[:8]})"
+    return type(value).__name__
+
+
+def _dbg(label: str, **items: object) -> None:
+    if not _DEBUG_INPUT_BATCH:
+        return
+    payload = {k: _dbg_value(v) for k, v in items.items()}
+    logger.info("[InputBatchDebug] %s %s", label, payload)
+
 
 def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
+    _dbg("_normalize_prompt_embeds", x=x)
     if x.ndim == 2:
         return x.unsqueeze(0)
     if x.ndim == 3:
@@ -30,6 +60,7 @@ def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
 
 
 def _normalize_mask(x: torch.Tensor) -> torch.Tensor:
+    _dbg("_normalize_mask", x=x)
     if x.ndim == 1:
         x = x.unsqueeze(0)
     elif x.ndim != 2:
@@ -93,6 +124,7 @@ def _prepare_prompt_field_on_state(
     mask_attr: str,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     embeds = getattr(state, embeds_attr)
+    _dbg("_prepare_prompt_field_on_state", request_id=getattr(state, "request_id", None), embeds_attr=embeds_attr, embeds=embeds, mask=getattr(state, mask_attr))
     if embeds is None:
         return None, None
 
@@ -275,6 +307,7 @@ def _prepare_padded_prompt_fields(
     embeds_out: torch.Tensor | None = None,
     mask_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    _dbg("_prepare_padded_prompt_fields", embeds_attr=embeds_attr, mask_attr=mask_attr, states=states)
     prepared_fields = [
         _prepare_prompt_field_on_state(
             state,
@@ -532,6 +565,28 @@ def _prepare_negative_prompt_embeds(
     )
 
 
+def _align_prompt_embedding_pairs(
+    prompt_embeds: torch.Tensor | None,
+    prompt_embeds_mask: torch.Tensor | None,
+    negative_prompt_embeds: torch.Tensor | None,
+    negative_prompt_embeds_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if prompt_embeds is None or negative_prompt_embeds is None:
+        return prompt_embeds, prompt_embeds_mask, negative_prompt_embeds, negative_prompt_embeds_mask
+    if prompt_embeds.ndim == 2:
+        prompt_embeds = prompt_embeds.unsqueeze(0)
+    if negative_prompt_embeds.ndim == 2:
+        negative_prompt_embeds = negative_prompt_embeds.unsqueeze(0)
+    target_seq_len = max(int(prompt_embeds.shape[1]), int(negative_prompt_embeds.shape[1]))
+    prompt_embeds = _pad_prompt_embeds(prompt_embeds, target_seq_len)
+    negative_prompt_embeds = _pad_prompt_embeds(negative_prompt_embeds, target_seq_len)
+    if prompt_embeds_mask is not None:
+        prompt_embeds_mask = _pad_mask(prompt_embeds_mask, target_seq_len)
+    if negative_prompt_embeds_mask is not None:
+        negative_prompt_embeds_mask = _pad_mask(negative_prompt_embeds_mask, target_seq_len)
+    return prompt_embeds, prompt_embeds_mask, negative_prompt_embeds, negative_prompt_embeds_mask
+
+
 def _same_composition(
     cached_batch: InputBatch | None,
     request_ids: list[str],
@@ -660,6 +715,17 @@ class InputBatch:
             embeds_out=self.negative_prompt_embeds,
             mask_out=self.negative_prompt_embeds_mask,
         )
+        (
+            self.prompt_embeds,
+            self.prompt_embeds_mask,
+            self.negative_prompt_embeds,
+            self.negative_prompt_embeds_mask,
+        ) = _align_prompt_embedding_pairs(
+            self.prompt_embeds,
+            self.prompt_embeds_mask,
+            self.negative_prompt_embeds,
+            self.negative_prompt_embeds_mask,
+        )
         self.img_shapes = _prepare_img_shapes(states)
         self.txt_seq_lens = _prepare_seq_lens(states, "txt_seq_lens")
         self.negative_txt_seq_lens = _prepare_seq_lens(states, "negative_txt_seq_lens")
@@ -719,7 +785,13 @@ class InputBatch:
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
         negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(selected_states)
-        do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
+        prompt_embeds, prompt_embeds_mask, negative_prompt_embeds, negative_prompt_embeds_mask = _align_prompt_embedding_pairs(
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+        )
+        do_true_cfg, true_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
         return cls(
             request_ids=request_ids,
             num_reqs=len(selected_states),
@@ -730,7 +802,7 @@ class InputBatch:
             timesteps=_prepare_timesteps(selected_states),
             guidance=_prepare_guidance(selected_states),
             do_true_cfg=do_true_cfg,
-            true_cfg_scale=true_cfg_scale,
+            true_cfg_scale=true_scale,
             cfg_normalize=cfg_normalize,
             image_latents=_prepare_image_latents(selected_states),
             prompt_embeds=prompt_embeds,

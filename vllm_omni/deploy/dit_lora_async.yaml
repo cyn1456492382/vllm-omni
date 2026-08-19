@@ -1,0 +1,43 @@
+pipeline: z_image
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "0,1"
+    cache_backend:
+    cache_config:
+    enable_cache_dit_summary: false
+    step_execution: true
+    diffusion_compile_granularity: regional
+    diffusion_compile_dynamic: false
+    dit_lora_overlap_granularity: 3
+    dit_lora_enable_profiling: true
+    dit_lora_inventory_path: /tmp/dit_lora_module_inventory.json
+    dit_lora_task_trace_path: /tmp/dit_lora_task_trace.json
+    dit_lora_runtime_debug: false
+    edge_dit_lora_host: 127.0.0.1
+    edge_dit_lora_port: 9260
+    edge_dit_lora_wire_precision: fp16
+    edge_dit_lora_fail_closed: true
+    edge_dit_lora_prefetch_depth: 1
+    edge_dit_lora_async_timeout_s: 30.0
+    lora_path: /mnt/ssd/cyn/vllm/edge_dit_lora_real/adapters/catalog/zimage_distill_patch
+    max_cpu_loras: 4
+    default_sampling_params:
+      seed: 42
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        devices: "0,1"
+        gpu_memory_utilization: 0.9
+        enforce_eager: true
+        step_execution: true
+        dit_lora_overlap_granularity: 3
+        dit_lora_enable_profiling: true
+        edge_dit_lora_host: 127.0.0.1
+        edge_dit_lora_port: 9260

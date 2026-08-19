@@ -15,9 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import inspect
 import json
 import os
+from pprint import pformat
 from collections.abc import Callable, Iterable
 from typing import Any, ClassVar
 
@@ -32,6 +34,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.lora.dit_lora_overlap import runtime as lora_runtime, set_overlap_granularity
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -48,6 +51,89 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+_DEBUG_ZIMAGE_INPUTS = os.environ.get("ZIMAGE_DEBUG_INPUTS", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _unwrap_single_item_list(value: Any) -> Any:
+    if isinstance(value, list) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _pad_embeddings_to_length(
+    embeds: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    target_len: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if embeds is None:
+        return None, mask
+    if embeds.ndim == 2:
+        embeds = embeds.unsqueeze(0)
+    if mask is not None and mask.ndim == 1:
+        mask = mask.unsqueeze(0)
+    seq_len = int(embeds.shape[1])
+    if seq_len == target_len:
+        return embeds, mask
+    if seq_len > target_len:
+        embeds = embeds[:, :target_len]
+        if mask is not None:
+            mask = mask[:, :target_len]
+        return embeds, mask
+    pad_len = target_len - seq_len
+    embeds = torch.nn.functional.pad(embeds, (0, 0, 0, pad_len), value=0.0)
+    if mask is not None:
+        mask = torch.nn.functional.pad(mask, (0, pad_len), value=False)
+    return embeds, mask
+
+
+def _batch_request_embeddings(
+    states: list[Any],
+    embeds_attr: str,
+    mask_attr: str,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Pad and concatenate one embedding tensor from each request state."""
+    embeddings = [getattr(state, embeds_attr, None) for state in states]
+    masks = [getattr(state, mask_attr, None) for state in states]
+    if not embeddings or any(embedding is None for embedding in embeddings):
+        return None, None
+
+    target_len = max(int(embedding.shape[1]) for embedding in embeddings)
+    padded = [
+        _pad_embeddings_to_length(embedding, mask, target_len)
+        for embedding, mask in zip(embeddings, masks)
+    ]
+    return (
+        torch.cat([embedding for embedding, _ in padded], dim=0),
+        torch.cat([mask for _, mask in padded if mask is not None], dim=0)
+        if all(mask is not None for _, mask in padded)
+        else None,
+    )
+
+
+def _dbg_type(value: Any) -> str:
+    if value is None:
+        return "None"
+    return f"{type(value).__name__}"
+
+
+def _dbg_value(value: Any) -> str:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return repr(value)
+    if isinstance(value, torch.Tensor):
+        return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+    if isinstance(value, list):
+        sample = [_dbg_type(v) for v in value[:3]]
+        return f"list(len={len(value)}, sample_types={sample})"
+    if isinstance(value, dict):
+        return f"dict(keys={list(value.keys())[:8]})"
+    return type(value).__name__
+
+
+def _zimage_debug(label: str, **items: Any) -> None:
+    if not _DEBUG_ZIMAGE_INPUTS:
+        return
+    payload = {k: _dbg_value(v) for k, v in items.items()}
+    logger.info("[ZImageDebug] %s %s", label, pformat(payload))
 
 
 def get_post_process_func(
@@ -163,6 +249,7 @@ def retrieve_timesteps(
 
 class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
     supports_request_batch = False
+    supports_step_execution = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
@@ -246,12 +333,27 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         device: torch.device | None = None,
         do_classifier_free_guidance: bool = True,
         negative_prompt: str | list[str] | None = None,
-        prompt_embeds: list[torch.FloatTensor] | None = None,
-        negative_prompt_embeds: torch.FloatTensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
-    ):
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        prompt_embeds = self._encode_prompt(
+        _zimage_debug(
+            "encode_prompt",
+            prompt=prompt,
+            device=device,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            max_sequence_length=max_sequence_length,
+        )
+        prompt_embeds, prompt_embeds_mask = self._encode_prompt(
             prompt=prompt,
             device=device,
             prompt_embeds=prompt_embeds,
@@ -264,27 +366,44 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             else:
                 negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
             assert len(prompt) == len(negative_prompt)
-            negative_prompt_embeds = self._encode_prompt(
+            negative_prompt_embeds, negative_prompt_embeds_mask = self._encode_prompt(
                 prompt=negative_prompt,
                 device=device,
                 prompt_embeds=negative_prompt_embeds,
                 max_sequence_length=max_sequence_length,
             )
         else:
-            negative_prompt_embeds = []
-        return prompt_embeds, negative_prompt_embeds
+            negative_prompt_embeds = None
+            negative_prompt_embeds_mask = None
+        return prompt_embeds, negative_prompt_embeds, prompt_embeds_mask, negative_prompt_embeds_mask
 
     def _encode_prompt(
         self,
         prompt: str | list[str],
         device: torch.device | None = None,
-        prompt_embeds: list[torch.FloatTensor] | None = None,
+        prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
-    ) -> list[torch.FloatTensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         device = device or self._execution_device
+        _zimage_debug(
+            "_encode_prompt_entry",
+            prompt=prompt,
+            device=device,
+            prompt_embeds=prompt_embeds,
+            max_sequence_length=max_sequence_length,
+        )
 
         if prompt_embeds is not None:
-            return prompt_embeds
+            if not isinstance(prompt_embeds, torch.Tensor):
+                raise TypeError(f"prompt_embeds must be a Tensor, got {type(prompt_embeds).__name__}")
+            if prompt_embeds.ndim == 2:
+                prompt_embeds = prompt_embeds.unsqueeze(0)
+            prompt_masks = torch.ones(
+                (prompt_embeds.shape[0], prompt_embeds.shape[1]),
+                dtype=torch.bool,
+                device=prompt_embeds.device,
+            )
+            return prompt_embeds, prompt_masks
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -318,12 +437,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             output_hidden_states=True,
         ).hidden_states[-2]
 
-        embeddings_list = []
-
-        for i in range(len(prompt_embeds)):
-            embeddings_list.append(prompt_embeds[i][prompt_masks[i]])
-
-        return embeddings_list
+        return prompt_embeds, prompt_masks
 
     def prepare_latents(
         self,
@@ -337,6 +451,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         latents=None,
         image=None,
         timestep=None,
+        scheduler=None,
     ):
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
         width = 2 * (int(width) // (self.vae_scale_factor * 2))
@@ -371,7 +486,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 )
 
             noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            latents = self.scheduler.scale_noise(image_latents, timestep, noise)
+            scheduler = scheduler or self.scheduler
+            latents = scheduler.scale_noise(image_latents, timestep, noise)
             return latents
 
         if latents is None:
@@ -382,12 +498,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             latents = latents.to(device)
         return latents
 
-    def get_timesteps(self, num_inference_steps, strength, device):
+    def get_timesteps(self, scheduler, num_inference_steps, strength, device):
         init_timestep = min(num_inference_steps * strength, num_inference_steps)
         t_start = int(max(num_inference_steps - init_timestep, 0))
-        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
-        if hasattr(self.scheduler, "set_begin_index"):
-            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        timesteps = scheduler.timesteps[t_start * scheduler.order :]
+        if hasattr(scheduler, "set_begin_index"):
+            scheduler.set_begin_index(t_start * scheduler.order)
         return timesteps, num_inference_steps - t_start
 
     @property
@@ -409,6 +525,171 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
     @property
     def interrupt(self):
         return self._interrupt
+
+    def prepare_encode(self, state: "StepRequestState", **kwargs: Any) -> "StepRequestState":
+        del kwargs
+        prompt = state.prompt if isinstance(state.prompt, str) else (state.prompt.get("prompt") or "") if state.prompt is not None else ""
+        negative_prompt = None
+        if isinstance(state.prompt, dict) and state.prompt.get("negative_prompt") is not None:
+            negative_prompt = state.prompt.get("negative_prompt") or ""
+        device = self._execution_device
+        sampling = state.sampling
+        scheduler = copy.deepcopy(self.scheduler)
+        _zimage_debug(
+            "prepare_encode_entry",
+            state_prompt=state.prompt,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            device=device,
+            sampling=sampling,
+        )
+        self._guidance_scale = float(sampling.guidance_scale or 0.0)
+        self._interrupt = False
+        self._cfg_normalization = sampling.cfg_normalize
+        self._cfg_truncation = sampling.extra_args.get("cfg_truncation", 1.0)
+        prompt_embeds, negative_prompt_embeds, prompt_embeds_mask, negative_prompt_embeds_mask = self.encode_prompt(
+            prompt=[prompt],
+            negative_prompt=None if negative_prompt is None else [negative_prompt],
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            device=device,
+            max_sequence_length=sampling.max_sequence_length or 512,
+        )
+        height = sampling.height or 1024
+        width = sampling.width or 1024
+        num_inference_steps = sampling.num_inference_steps or 50
+        generator = sampling.generator
+        sigmas = sampling.sigmas
+        num_images_per_prompt = sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1
+        image = None
+        multi_modal_data = state.prompt.get("multi_modal_data", {}) if isinstance(state.prompt, dict) else {}
+        raw_image = multi_modal_data.get("image") if isinstance(multi_modal_data, dict) else None
+        _zimage_debug(
+            "prepare_encode_image",
+            state_prompt=state.prompt,
+            multi_modal_data=multi_modal_data,
+            raw_image=raw_image,
+        )
+        if isinstance(raw_image, list):
+            raw_image = raw_image[0] if raw_image else None
+        if raw_image is not None:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
+        num_channels_latents = self.transformer.in_channels
+        if image is not None and not isinstance(image, torch.Tensor):
+            image = self.image_processor.preprocess(image, height, width).to(dtype=torch.float32, device=device)
+        if image is not None:
+            mu = calculate_shift(
+                (height // self.vae_scale_factor // 2) * (width // self.vae_scale_factor // 2),
+                scheduler.config.get("base_image_seq_len", 256),
+                scheduler.config.get("max_image_seq_len", 4096),
+                scheduler.config.get("base_shift", 0.5),
+                scheduler.config.get("max_shift", 1.15),
+            )
+            scheduler.sigma_min = 0.0
+            timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
+            timesteps, num_inference_steps = self.get_timesteps(scheduler, num_inference_steps, sampling.strength or 0.6, device)
+            latent_timestep = timesteps[:1].repeat(num_images_per_prompt)
+            latents = self.prepare_latents(num_images_per_prompt, num_channels_latents, height, width, prompt_embeds[0].dtype, device, generator, sampling.latents, image, latent_timestep, scheduler)
+        else:
+            mu = calculate_shift((height // self.vae_scale_factor // 2) * (width // self.vae_scale_factor // 2), scheduler.config.get("base_image_seq_len", 256), scheduler.config.get("max_image_seq_len", 4096), scheduler.config.get("base_shift", 0.5), scheduler.config.get("max_shift", 1.15))
+            scheduler.sigma_min = 0.0
+            timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=sigmas, mu=mu)
+            latents = self.prepare_latents(num_images_per_prompt, num_channels_latents, height, width, torch.float32, device, generator, sampling.latents)
+        state.extra.update({"image": image, "num_images_per_prompt": num_images_per_prompt, "timesteps": timesteps})
+        state.prompt_embeds = prompt_embeds
+        state.prompt_embeds_mask = prompt_embeds_mask
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
+        state.latents = latents
+        state.scheduler = scheduler
+        state.timesteps = timesteps
+        state.step_index = 0
+        return state
+
+    def denoise_step(self, input_batch: "InputBatch", **kwargs: Any) -> torch.Tensor | None:
+        del kwargs
+        req_states = getattr(input_batch, "states", None) or []
+        if not req_states:
+            return None
+        state = req_states[0]
+        prompt_embeds, prompt_embeds_mask = _batch_request_embeddings(
+            req_states,
+            "prompt_embeds",
+            "prompt_embeds_mask",
+        )
+        if prompt_embeds is None:
+            return None
+        negative_prompt_embeds, negative_prompt_embeds_mask = _batch_request_embeddings(
+            req_states,
+            "negative_prompt_embeds",
+            "negative_prompt_embeds_mask",
+        )
+        t = input_batch.timesteps
+        latents = input_batch.latents.to(self.od_config.dtype)
+        runtime = lora_runtime()
+        runtime.request_id = state.request_id
+        runtime.batch_request_ids = tuple(
+            item.request_id
+            for item in req_states
+            for _ in range(int(item.latents.shape[0]))
+        )
+        runtime.step_index = int(state.step_index)
+        apply_cfg = (
+            self.do_classifier_free_guidance
+            and self.guidance_scale > 0
+            and negative_prompt_embeds is not None
+        )
+        runtime.batch_repeat = 2 if apply_cfg else 1
+        _zimage_debug(
+            "denoise_step_entry",
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            timesteps=t,
+            latents=latents,
+            apply_cfg=apply_cfg,
+        )
+        if apply_cfg:
+            prompt_embeds, prompt_embeds_mask = _pad_embeddings_to_length(
+                prompt_embeds,
+                prompt_embeds_mask,
+                max(int(prompt_embeds.shape[1]), int(negative_prompt_embeds.shape[1])),
+            )
+            negative_prompt_embeds, negative_prompt_embeds_mask = _pad_embeddings_to_length(
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+                int(prompt_embeds.shape[1]),
+            )
+        latent_model_input = latents.repeat(2, 1, 1, 1) if apply_cfg else latents
+        prompt_embeds_model_input = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0) if apply_cfg else prompt_embeds
+        timestep_model_input = t.repeat(2) if apply_cfg else t
+        latent_model_input = latent_model_input.unsqueeze(2)
+        latent_model_input_list = list(latent_model_input.unbind(dim=0))
+        model_out_list = self.transformer(latent_model_input_list, timestep_model_input, prompt_embeds_model_input)[0]
+        if apply_cfg:
+            pos_out = model_out_list[: latents.shape[0]]
+            neg_out = model_out_list[latents.shape[0] :]
+            noise_pred = torch.stack([p.float() + self.guidance_scale * (p.float() - n.float()) for p, n in zip(pos_out, neg_out)], dim=0)
+        else:
+            noise_pred = torch.stack([out.float() for out in model_out_list], dim=0)
+        return -noise_pred.squeeze(2)
+
+    def step_scheduler(self, state: "StepRequestState", noise_pred: torch.Tensor, **kwargs: Any) -> None:
+        del kwargs
+        t = state.current_timestep
+        scheduler = state.scheduler or self.scheduler
+        state.latents = scheduler.step(noise_pred.to(torch.float32), t, state.latents, return_dict=False)[0]
+        state.step_index += 1
+
+    def post_decode(self, state: "StepRequestState", **kwargs: Any) -> DiffusionOutput:
+        del kwargs
+        latents = state.latents
+        if latents is None:
+            raise ValueError("post_decode requires latents")
+        latents = latents.to(self.vae.dtype)
+        latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        image = self.vae.decode(latents, return_dict=False)[0]
+        return DiffusionOutput(output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None)
 
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
         # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
@@ -435,8 +716,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 raw_image = first_prompt.get("multi_modal_data", {}).get("image")
                 if raw_image is not None:
                     if isinstance(raw_image, list):
-                        image = [PIL.Image.open(im) if isinstance(im, str) else raw_image[0] for im in raw_image[:1]]
-                    else:
+                        raw_image = raw_image[0] if raw_image else None
+                    if raw_image is not None:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
         explicit_strength = req.sampling_params.strength is not None
@@ -495,6 +776,8 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         (
             prompt_embeds,
             negative_prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds_mask,
         ) = self.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -510,10 +793,6 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
         # img2img mode: prepare latents from input image
         if image is not None:
-            # Handle image list - take first image
-            if isinstance(image, list):
-                image = image[0]
-
             # Prepare image for VAE encoding using image_processor
             if not isinstance(image, torch.Tensor):
                 init_image = self.image_processor.preprocess(image, height, width)
@@ -576,9 +855,21 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
         # Repeat prompt_embeds for num_images_per_prompt
         if num_images_per_prompt > 1:
-            prompt_embeds = [pe for pe in prompt_embeds for _ in range(num_images_per_prompt)]
-            if self.do_classifier_free_guidance and negative_prompt_embeds:
-                negative_prompt_embeds = [npe for npe in negative_prompt_embeds for _ in range(num_images_per_prompt)]
+            prompt_embeds = prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+            prompt_embeds_mask = prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+            if self.do_classifier_free_guidance and negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+                if negative_prompt_embeds_mask is not None:
+                    negative_prompt_embeds_mask = negative_prompt_embeds_mask.repeat_interleave(num_images_per_prompt, dim=0)
+
+        if prompt_embeds is not None and negative_prompt_embeds is not None:
+            target_embed_len = max(int(prompt_embeds.shape[1]), int(negative_prompt_embeds.shape[1]))
+            prompt_embeds, prompt_embeds_mask = _pad_embeddings_to_length(prompt_embeds, prompt_embeds_mask, target_embed_len)
+            negative_prompt_embeds, negative_prompt_embeds_mask = _pad_embeddings_to_length(
+                negative_prompt_embeds,
+                negative_prompt_embeds_mask,
+                target_embed_len,
+            )
 
         actual_batch_size = batch_size * num_images_per_prompt
 
@@ -644,7 +935,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
             if apply_cfg:
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
-                prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+                prompt_embeds_model_input = torch.cat([prompt_embeds, negative_prompt_embeds], dim=0)
                 timestep_model_input = timestep.repeat(2)
             else:
                 latent_model_input = latents_typed
