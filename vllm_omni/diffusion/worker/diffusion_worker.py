@@ -676,6 +676,20 @@ class DiffusionWorker:
                 torch.cuda.reset_peak_memory_stats(self.device)
         return cuda_memory_snapshot(self.device)
 
+    def trim_cuda_memory_cache(self) -> dict[str, object]:
+        """Release inactive allocator blocks while preserving live model tensors."""
+        before = cuda_memory_snapshot(self.device)
+        collected = gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(self.device)
+        return {
+            "gc_collected_objects": collected,
+            "before": before,
+            "after": cuda_memory_snapshot(self.device),
+        }
+
     def sleep(self, level: int = 1) -> int:
         """
         Put the worker to sleep, offloading model weights.

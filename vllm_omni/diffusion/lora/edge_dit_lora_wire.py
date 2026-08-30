@@ -26,7 +26,9 @@ def encode_activation(x: torch.Tensor, precision: str) -> bytes:
     arr = x.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
     p = precision.lower()
     if p in ("fp16", "float16"):
-        return arr.astype(np.float16).tobytes()
+        if not np.isfinite(arr).all():
+            raise ValueError("fp16 wire payload contains non-finite values")
+        return np.clip(arr, -65504.0, 65504.0).astype(np.float16).tobytes()
     if p == "int8":
         flat = arr.reshape(-1)
         max_abs = float(np.max(np.abs(flat))) if flat.size else 0.0
@@ -92,7 +94,12 @@ def decode_activation(
         q = q[:n].astype(np.float32) * scale
         return torch.from_numpy(q.reshape(shape).copy())
     if p in ("fp16", "float16"):
-        arr = np.frombuffer(payload, dtype=np.float16).astype(np.float32)
+        expected_bytes = numel * np.dtype(np.float16).itemsize
+        if len(payload) < expected_bytes:
+            raise ValueError(f"payload too short: {len(payload)} < {expected_bytes}")
+        arr = np.frombuffer(payload[:expected_bytes], dtype=np.float16).astype(
+            np.float32
+        )
     else:
         arr = np.frombuffer(payload, dtype=np.float32).copy()
     if arr.size < numel:

@@ -322,7 +322,18 @@ class ZImageAttention(nn.Module):
     def project_qkv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval(
+            "base_to_qkv",
+            module_name="transformer.attention.to_qkv",
+            logical_stages=["to_q", "to_k", "to_v"],
+        )
         qkv, _ = self.to_qkv(hidden_states)
+        finish_interval(interval, output_shape=list(qkv.shape))
         qkv = _restore_linear_output_shape(qkv, hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
@@ -341,18 +352,43 @@ class ZImageAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        attention_interval = start_interval(
+            "base_attention",
+            module_name="transformer.attention",
+        )
+        norm_interval = start_interval(
+            "base_qk_norm_rope",
+            module_name="transformer.attention",
+        )
         query = self.norm_q(query)
         key = self.norm_k(key)
         query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+        finish_interval(norm_interval)
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
         hidden_states = self.attn(query, key, value)
+        finish_interval(attention_interval, output_shape=list(hidden_states.shape))
         return hidden_states.flatten(2, 3).to(dtype)
 
     def project_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval(
+            "base_to_out",
+            module_name="transformer.attention.to_out",
+        )
         output = self.to_out[0](hidden_states)
+        finish_interval(interval, output_shape=list(output.shape))
         return _restore_linear_output_shape(output, hidden_states)
 
     def forward(
@@ -362,11 +398,22 @@ class ZImageAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ):
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval(
+            "base_attention_e2e",
+            module_name="transformer.attention",
+        )
         query, key, value = self.project_qkv(hidden_states)
         hidden_states = self.compute_attention(
             query, key, value, attention_mask, cos, sin
         )
-        return self.project_output(hidden_states)
+        output = self.project_output(hidden_states)
+        finish_interval(interval, output_shape=list(output.shape))
+        return output
 
 
 class FeedForward(nn.Module):
@@ -398,16 +445,40 @@ class FeedForward(nn.Module):
         )
 
     def project_up(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval("base_ffn_up", module_name="transformer.feed_forward")
         hidden_states = self.w13(x)
+        finish_interval(interval, output_shape=list(hidden_states.shape))
         return _restore_linear_output_shape(hidden_states, x)
 
     def activate(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.act(hidden_states)
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval(
+            "base_ffn_activation", module_name="transformer.feed_forward"
+        )
+        output = self.act(hidden_states)
+        finish_interval(interval, output_shape=list(output.shape))
+        return output
 
     def project_down(
         self, hidden_states: torch.Tensor, residual_shape: torch.Tensor
     ) -> torch.Tensor:
+        from vllm_omni.diffusion.lora.lora_compute_breakdown import (
+            finish_interval,
+            start_interval,
+        )
+
+        interval = start_interval("base_ffn_down", module_name="transformer.feed_forward")
         output = self.w2(hidden_states)
+        finish_interval(interval, output_shape=list(output.shape))
         return _restore_linear_output_shape(output, residual_shape)
 
     def forward(self, x):
@@ -1009,6 +1080,11 @@ class ZImageTransformer2DModel(CachedTransformer):
             "zimage_transformer_forward",
             module_name="transformer",
         )
+        base_model_interval = start_interval(
+            "base_model_e2e",
+            module_name="transformer",
+            execution_scope="full_zimage_transformer_forward",
+        )
         pre_noise_interval = start_interval(
             "zimage_pre_noise_refiner",
             module_name="transformer",
@@ -1063,7 +1139,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         )
         for layer_index, layer in enumerate(self.noise_refiner):
             block_interval = start_interval(
-                "transformer_block",
+                "base_transformer_block",
                 module_name=f"transformer.noise_refiner.{layer_index}",
             )
             x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
@@ -1107,7 +1183,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         )
         for layer_index, layer in enumerate(self.context_refiner):
             block_interval = start_interval(
-                "transformer_block",
+                "base_transformer_block",
                 module_name=f"transformer.context_refiner.{layer_index}",
             )
             cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
@@ -1191,7 +1267,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         for layer_index, layer in enumerate(self.layers):
             block_name = f"block_{layer_index}"
             block_interval = start_interval(
-                "transformer_block",
+                "base_transformer_block",
                 module_name=f"transformer.layers.{layer_index}",
             )
             if granularity == 2:
@@ -1220,6 +1296,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         unified = list(unified.unbind(dim=0))
         x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
         finish_interval(final_unpatchify_interval)
+        finish_interval(base_model_interval, output_count=len(x))
         finish_interval(transformer_total_interval)
 
         return x, {}

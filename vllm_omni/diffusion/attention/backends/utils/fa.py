@@ -62,9 +62,12 @@ else:
     # selected and fail at launch with "no kernel image is available".
     if _is_blackwell():
         try:
-            from flash_attn.cute import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+            from vllm.vllm_flash_attn.cute import (  # noqa: F401
+                flash_attn_func,
+                flash_attn_varlen_func,
+            )
 
-            logger.info("Using CuTe FlashAttention-4 on Blackwell")
+            logger.info("Using vLLM CuTe FlashAttention-4 on Blackwell")
         except Exception as exc:
             # Optional FA4 dependencies may be present but ABI-incompatible
             # (for example, mismatched CUTLASS DSL and Quack builds). Treat

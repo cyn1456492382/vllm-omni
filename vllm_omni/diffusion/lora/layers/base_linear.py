@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import torch
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
@@ -28,6 +29,29 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     All other functionality (weight management, TP slicing, forward logic)
     is inherited from vLLM's BaseLinearLayerWithLoRA.
     """
+
+    @staticmethod
+    def _lora_activation_enabled(module_name: str | None) -> bool:
+        """Apply optional experiment-wide timestep/block LoRA masks."""
+        step_start = int(os.environ.get("VLLM_OMNI_LORA_STEP_START", "0"))
+        step_end = int(os.environ.get("VLLM_OMNI_LORA_STEP_END", "-1"))
+        block_start = int(os.environ.get("VLLM_OMNI_LORA_BLOCK_START", "0"))
+        block_end = int(os.environ.get("VLLM_OMNI_LORA_BLOCK_END", "-1"))
+        try:
+            from vllm_omni.diffusion.lora.dit_lora_overlap import runtime
+
+            step_index = int(runtime().step_index)
+        except Exception:
+            step_index = 0
+        if step_end >= step_start and not step_start <= step_index <= step_end:
+            return False
+        if block_end < block_start:
+            return True
+        match = re.search(r"(?:layers|noise_refiner|context_refiner)\.(\d+)", str(module_name))
+        if match is None:
+            return False
+        block_index = int(match.group(1))
+        return block_start <= block_index <= block_end
 
     def create_lora_weights(
         self,
@@ -78,6 +102,114 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         self._diffusion_lora_batch_slot_indices = tuple(slot_indices)
         self._diffusion_lora_batch_usage_emitted = False
 
+    def _apply_split_lora(
+        self,
+        module_name: str,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        batch_slot_indices: tuple[int | None, ...],
+    ) -> torch.Tensor | None:
+        try:
+            from vllm_omni.diffusion.lora.edge_dit_lora_runtime import (
+                maybe_edge_dit_lora_a_projection,
+            )
+        except Exception:
+            return None
+
+        projection_features = sum(
+            int(a.shape[2]) for a in self.lora_a_stacked
+        )
+        split_records = maybe_edge_dit_lora_a_projection(
+            module_name,
+            x_flat,
+            batch_slot_indices,
+            response_features=projection_features,
+            module_out_features=int(y_flat.shape[-1]),
+            route_on_edge=True,
+        )
+        if not split_records:
+            return None
+
+        row_slot_indices = torch.repeat_interleave(
+            torch.tensor(
+                [slot if slot is not None else -1 for slot in batch_slot_indices],
+                device=x_flat.device,
+                dtype=torch.long,
+            ),
+            x_flat.shape[0] // len(batch_slot_indices),
+        )
+        hidden_offset = 0
+        output_offset = 0
+        applied_slots: set[int] = set()
+        lora_a_flops = 0
+        lora_b_flops = 0
+        residual_add_flops = 0
+        total_interval = start_interval(
+            "lora_total",
+            module_name=module_name,
+            split_mode="split01_or_split02",
+            input_shape=list(x_flat.shape),
+            output_shape=list(y_flat.shape),
+        )
+        for slice_idx, slice_size in enumerate(output_slices):
+            a = self.lora_a_stacked[slice_idx][0, 0]
+            rank = int(a.shape[0])
+            b_stack = self.lora_b_stacked[slice_idx]
+            for record in split_records:
+                group_mask = record["row_mask"]
+                group_rows = group_mask.nonzero(as_tuple=False).flatten()
+                group_hidden = record["hidden"]
+                for slot_index in record["slot_indices"]:
+                    rows = group_mask & (row_slot_indices == slot_index)
+                    row_positions = (rows[group_rows]).nonzero(as_tuple=False).flatten()
+                    if row_positions.numel() == 0:
+                        continue
+                    selected_hidden = group_hidden[row_positions, hidden_offset : hidden_offset + rank]
+                    common = {
+                        "module_name": module_name,
+                        "slice_index": slice_idx,
+                        "slot_index": slot_index,
+                        "split_mode": "split01_or_split02",
+                    }
+                    b = b_stack[slot_index, 0]
+                    b_interval = start_interval(
+                        "lora_b_gemm", **common, input_shape=list(selected_hidden.shape)
+                    )
+                    delta = selected_hidden @ b.t()
+                    lora_b_flops += 2 * int(selected_hidden.shape[0]) * int(b.shape[1]) * int(b.shape[0])
+                    finish_interval(b_interval, output_shape=list(delta.shape))
+                    gather_interval = start_interval("lora_output_gather", **common)
+                    current_output = y_flat[rows, output_offset : output_offset + slice_size]
+                    finish_interval(gather_interval, output_slice_shape=list(current_output.shape))
+                    residual_interval = start_interval("lora_residual_add", **common)
+                    updated_output = current_output + delta
+                    residual_add_flops += int(current_output.numel())
+                    finish_interval(residual_interval, residual_shape=list(updated_output.shape))
+                    writeback_interval = start_interval("lora_writeback", **common)
+                    y_flat[rows, output_offset : output_offset + slice_size] = updated_output
+                    finish_interval(writeback_interval, output_offset=output_offset)
+                    applied_slots.add(int(slot_index))
+            hidden_offset += rank
+            output_offset += slice_size
+
+        finish_interval(total_interval, applied_slot_indices=sorted(applied_slots))
+        if applied_slots:
+            record_lora_flops(
+                lora_a_flops=lora_a_flops,
+                lora_b_flops=lora_b_flops,
+                residual_add_flops=residual_add_flops,
+            )
+            emit_event(
+                "lora_events",
+                "lora_split_path_applied",
+                module_name=module_name,
+                split_mode="split01_or_split02",
+                applied_slot_indices=sorted(applied_slots),
+                edge_records=len(split_records),
+            )
+        return y_flat
+
     def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """
         override: Use simple matmul instead of punica_wrapper.add_lora_linear().
@@ -104,6 +236,11 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         x_flat = x.reshape(-1, x.shape[-1])
         y_flat = output.reshape(-1, output.shape[-1])
 
+        if not self._lora_activation_enabled(module_name):
+            return output
+
+        lora_path_interval = None
+
         # Edge-owned path: prefer remote residual when runtime metadata targets
         # this module. Checked before local LoRA so edge-only modules work
         # without cloud A/B weights.
@@ -115,6 +252,13 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             except Exception:  # pragma: no cover
                 maybe_edge_dit_lora_residual = None  # type: ignore[assignment]
             if maybe_edge_dit_lora_residual is not None:
+                lora_path_interval = start_interval(
+                    "lora_path_e2e",
+                    module_name=module_name,
+                    execution_location="edge",
+                    input_shape=list(x_flat.shape),
+                    output_shape=list(y_flat.shape),
+                )
                 edge_delta = maybe_edge_dit_lora_residual(
                     str(module_name), x_flat, int(y_flat.shape[-1])
                 )
@@ -122,7 +266,13 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                     y_flat = y_flat + edge_delta.to(
                         device=y_flat.device, dtype=y_flat.dtype
                     )
+                    finish_interval(
+                        lora_path_interval,
+                        execution_location="edge",
+                        output_shape=list(y_flat.shape),
+                    )
                     return y_flat.view(original_shape)
+                finish_interval(lora_path_interval, execution_location="none")
 
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
             return output
@@ -164,6 +314,29 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             slot is None for slot in batch_slot_indices
         ):
             return output
+
+        lora_path_interval = start_interval(
+            "lora_path_e2e",
+            module_name=module_name,
+            execution_location="cloud",
+            input_shape=list(x_flat.shape),
+            output_shape=list(y_flat.shape),
+        )
+
+        split_output = self._apply_split_lora(
+            str(module_name),
+            x_flat,
+            y_flat,
+            tuple(int(size) for size in output_slices),
+            tuple(batch_slot_indices),
+        )
+        if split_output is not None:
+            finish_interval(
+                lora_path_interval,
+                execution_location="split",
+                output_shape=list(split_output.shape),
+            )
+            return split_output.view(original_shape)
         diagnostic_mode = os.environ.get(
             "VLLM_OMNI_LORA_DIAGNOSTIC_MODE", "normal"
         ).strip().lower()
@@ -240,6 +413,11 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             finish_interval(
                 total_interval,
                 applied_slot_indices=[],
+                diagnostic_mode=diagnostic_mode,
+            )
+            finish_interval(
+                lora_path_interval,
+                execution_location="cloud",
                 diagnostic_mode=diagnostic_mode,
             )
             return output
@@ -364,6 +542,11 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
 
         finish_interval(
             total_interval,
+            applied_slot_indices=sorted(applied_slot_indices),
+        )
+        finish_interval(
+            lora_path_interval,
+            execution_location="cloud",
             applied_slot_indices=sorted(applied_slot_indices),
         )
 

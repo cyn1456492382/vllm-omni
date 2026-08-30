@@ -1068,10 +1068,17 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"edge_dit_lora_port must be in [1, 65535], got {self.edge_dit_lora_port}"
             )
-        if self.edge_dit_lora_wire_precision not in {"fp16", "bf16", "fp32"}:
+        if self.edge_dit_lora_wire_precision not in {
+            "fp16",
+            "bf16",
+            "fp32",
+            "int8",
+            "int4",
+        }:
             raise ValueError(
                 "edge_dit_lora_wire_precision must be one of "
-                f"{{'fp16', 'bf16', 'fp32'}}, got {self.edge_dit_lora_wire_precision!r}"
+                f"{{'fp16', 'bf16', 'fp32', 'int8', 'int4'}}, "
+                f"got {self.edge_dit_lora_wire_precision!r}"
             )
 
         if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):

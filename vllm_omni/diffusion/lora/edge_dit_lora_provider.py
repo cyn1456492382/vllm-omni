@@ -55,6 +55,7 @@ class EdgeDiTLoRAResidualProvider:
         precision: str = "fp16",
         timeout_s: float = 5.0,
         fail_closed: bool = True,
+        profile_residual: bool = False,
     ) -> None:
         self.host = str(host)
         self.port = int(port)
@@ -62,6 +63,7 @@ class EdgeDiTLoRAResidualProvider:
         self.precision = str(precision)
         self.timeout_s = float(timeout_s)
         self.fail_closed = bool(fail_closed)
+        self.profile_residual = bool(profile_residual)
         self._sock: socket.socket | None = None
         self.last_meta: dict[str, Any] | None = None
         self._debug_path = Path("/tmp/edge_dit_provider_debug.jsonl")
@@ -99,6 +101,9 @@ class EdgeDiTLoRAResidualProvider:
         x: torch.Tensor,
         out_features: int,
         precision: str | None = None,
+        operation: str = "lora_residual",
+        response_features: int | None = None,
+        row_indices: list[int] | None = None,
     ) -> torch.Tensor:
         """Send activation and receive LoRA delta from the edge worker.
 
@@ -115,15 +120,24 @@ class EdgeDiTLoRAResidualProvider:
         prec = str(precision or self.precision)
         x_flat = x.reshape(-1, x.shape[-1])
         rows, in_features = int(x_flat.shape[0]), int(x_flat.shape[1])
+        expects_profile = self.profile_residual
         header: dict[str, Any] = {
-            "op": "lora_residual",
+            "op": (
+                "profile_lora_residual"
+                if expects_profile and operation == "lora_residual"
+                else operation
+            ),
             "module_name": str(module_name),
             "rows": rows,
             "in_features": in_features,
             "out_features": int(out_features),
+            "response_features": int(response_features or out_features),
             "precision": prec,
             "adapter_id": self.adapter_id,
+            "profile_response": expects_profile,
         }
+        if row_indices is not None:
+            header["row_indices"] = [int(index) for index in row_indices]
         request_payload = json.dumps(header, sort_keys=True).encode("utf-8")
         activation_payload = wire.encode_activation(x_flat, prec)
         request_frame_bytes = len(request_payload) + wire.FRAME_HEADER.size
@@ -164,23 +178,50 @@ class EdgeDiTLoRAResidualProvider:
                 send_ms = header_send_ms + activation_send_ms
                 recv_t0 = time.perf_counter()
                 payload = wire.recv_frame(sock)
+                edge_profile: dict[str, Any] | None = None
+                profile_frame_bytes = 0
+                if expects_profile:
+                    try:
+                        edge_profile = json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        # Backward-compatible fallback for the old worker.
+                        edge_profile = None
+                    else:
+                        profile_frame_bytes = len(payload) + wire.FRAME_HEADER.size
+                        if not edge_profile.get("ok"):
+                            raise RuntimeError(
+                                "edge worker error: {0}".format(
+                                    edge_profile.get("error", edge_profile)
+                                )
+                            )
+                        payload = wire.recv_frame(sock)
                 recv_ms = (time.perf_counter() - recv_t0) * 1000.0
                 if payload[:1] == b"{":
                     try:
                         err = json.loads(payload.decode("utf-8"))
-                    except Exception as decode_exc:
-                        raise RuntimeError(
-                            "edge worker returned non-delta JSON payload"
-                        ) from decode_exc
-                    raise RuntimeError(
-                        "edge worker error: {0}".format(
-                            err.get("error", err)
-                        )
-                    )
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        # A valid FP16 delta is arbitrary binary and can
+                        # coincidentally start with the ASCII byte "{".
+                        # Treat only parseable error objects as protocol errors.
+                        pass
+                    else:
+                        if isinstance(err, dict) and (
+                            "error" in err or err.get("ok") is False
+                        ):
+                            raise RuntimeError(
+                                "edge worker error: {0}".format(
+                                    err.get("error", err)
+                                )
+                            )
             finally:
                 sock.close()
             decode_t0 = time.perf_counter()
-            delta = wire.decode_delta(payload, (rows, int(out_features)), prec)
+            response_rows = len(row_indices) if row_indices is not None else rows
+            delta = wire.decode_delta(
+                payload,
+                (response_rows, int(response_features or out_features)),
+                prec,
+            )
             decode_ms = (time.perf_counter() - decode_t0) * 1000.0
             roundtrip_ms = connect_ms + send_ms + recv_ms + decode_ms
             self.last_meta = {
@@ -190,6 +231,10 @@ class EdgeDiTLoRAResidualProvider:
                 "request_frame_bytes": request_frame_bytes,
                 "activation_frame_bytes": activation_frame_bytes,
                 "response_payload_bytes": len(payload),
+                "response_profile_frame_bytes": profile_frame_bytes,
+                "response_frame_bytes": len(payload)
+                + wire.FRAME_HEADER.size
+                + profile_frame_bytes,
                 "provider_connect_ms": connect_ms,
                 "provider_header_send_ms": header_send_ms,
                 "provider_activation_send_ms": activation_send_ms,
@@ -197,6 +242,7 @@ class EdgeDiTLoRAResidualProvider:
                 "provider_recv_ms": recv_ms,
                 "provider_decode_ms": decode_ms,
                 "provider_roundtrip_ms": roundtrip_ms,
+                "edge_profile": edge_profile,
             }
             self._debug_event(
                 "send_ok",
@@ -207,12 +253,14 @@ class EdgeDiTLoRAResidualProvider:
                 request_payload_bytes=len(request_payload),
                 activation_payload_bytes=len(activation_payload),
                 response_payload_bytes=len(payload),
+                response_profile_frame_bytes=profile_frame_bytes,
                 connect_ms=connect_ms,
                 header_send_ms=header_send_ms,
                 activation_send_ms=activation_send_ms,
                 recv_ms=recv_ms,
                 decode_ms=decode_ms,
                 roundtrip_ms=roundtrip_ms,
+                edge_profile=edge_profile,
             )
             return delta.to(device=x.device, dtype=x.dtype)
         except (BrokenPipeError, TimeoutError, socket.timeout) as exc:
@@ -275,3 +323,23 @@ class EdgeDiTLoRAResidualProvider:
             if self.fail_closed:
                 raise
             raise
+
+    def compute_a_projection(
+        self,
+        module_name: str,
+        x: torch.Tensor,
+        response_features: int,
+        module_out_features: int | None = None,
+        precision: str | None = None,
+        row_indices: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Compute only the LoRA-A projection on the edge worker."""
+        return self.compute_residual(
+            module_name,
+            x,
+            out_features=int(module_out_features or response_features),
+            precision=precision,
+            operation="lora_a_projection",
+            response_features=response_features,
+            row_indices=row_indices,
+        )

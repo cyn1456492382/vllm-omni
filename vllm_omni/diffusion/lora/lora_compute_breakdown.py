@@ -118,6 +118,14 @@ def operation_enabled(operation: str) -> bool:
     return operation in allowed
 
 
+def _nvtx_range_name(operation: str) -> str:
+    if operation.startswith("lora_"):
+        return f"edge_dit_lora:{operation}"
+    if operation.startswith("base_"):
+        return f"edge_dit_base:{operation}"
+    return f"edge_dit_model:{operation}"
+
+
 def infer_block_name(module_name: str | None) -> str | None:
     """Derive a stable Z-Image block name from a runtime module path."""
     if not module_name:
@@ -166,8 +174,9 @@ def start_interval(operation: str, **payload: Any) -> PendingCudaInterval | None
         payload={"operation": operation, **payload},
     )
     if _truthy_env(_NVTX_ENABLED_ENV):
-        torch.cuda.nvtx.range_push(f"edge_dit_lora:{operation}")
-        interval.payload["nvtx_range"] = f"edge_dit_lora:{operation}"
+        nvtx_range = _nvtx_range_name(operation)
+        torch.cuda.nvtx.range_push(nvtx_range)
+        interval.payload["nvtx_range"] = nvtx_range
     start_event.record()
     return interval
 

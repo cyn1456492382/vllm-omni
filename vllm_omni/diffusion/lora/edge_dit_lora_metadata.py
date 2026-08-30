@@ -36,5 +36,11 @@ def materialize_edge_dit_lora_runtime_metadata(
             "fail_closed": bool(raw.get("fail_closed", True)),
             "timeout_s": float(raw.get("timeout_s", 30.0)),
             "block_coalesce": bool(raw.get("block_coalesce", False)),
+            "profile_residual": bool(raw.get("profile_residual", False)),
+            "split_mode": str(raw.get("split_mode", "none")),
+            "active_step_start": raw.get("active_step_start"),
+            "active_step_end": raw.get("active_step_end"),
+            "active_block_start": raw.get("active_block_start"),
+            "active_block_end": raw.get("active_block_end"),
         }
     return materialized
