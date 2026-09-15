@@ -91,6 +91,7 @@ class DiffusionLoRAManager:
         self._active_adapter_id: int | None = None
         self._adapter_scales: dict[int, float] = {}  # adapter_id -> external scale
         self._gpu_slot_adapters: dict[int, int] = {}
+        self._gpu_slot_scales: dict[int, float] = {}
         self._gpu_slot_access_order: OrderedDict[int, float] = OrderedDict()
 
         # LRU cache tracking (adapter_id -> last_used_time)
@@ -749,6 +750,7 @@ class DiffusionLoRAManager:
             )
 
         self._gpu_slot_adapters[slot_index] = adapter_id
+        self._gpu_slot_scales[slot_index] = float(scale)
         self._touch_gpu_slot(slot_index)
 
     def _touch_gpu_slot(self, slot_index: int) -> None:
@@ -891,6 +893,10 @@ class DiffusionLoRAManager:
                     scale,
                     protected_adapter_ids,
                 )
+            elif not math.isclose(
+                self._gpu_slot_scales.get(slot_index, 1.0), scale
+            ):
+                self._load_adapter_into_gpu_slot(adapter_id, slot_index, scale)
             adapter_to_slot[adapter_id] = slot_index
             self._touch_adapter_info(adapter_id)
             self._touch_gpu_slot(slot_index)
@@ -926,6 +932,112 @@ class DiffusionLoRAManager:
             "hbm": cuda_memory_snapshot(self.device),
         }
         emit_event("lora_events", "lora_batch_mapping", **payload)
+        return payload
+
+    def set_batch_adapter_composition_mapping(
+        self,
+        entries: list[list[tuple[LoRARequest | int | None, float]]],
+        request_ids: list[str],
+    ) -> dict[str, object]:
+        """Publish ordered resident adapter compositions for a DiT batch.
+
+        This is an opt-in admission path for the resident Multi-LoRA operator.
+        Every adapter is loaded into a GPU slot before any layer receives the
+        immutable request-to-slot relation.
+        """
+        if len(entries) != len(request_ids):
+            raise ValueError("LoRA compositions and request IDs must match")
+
+        requested_scales: dict[int, float] = {}
+        for request_index, request_entries in enumerate(entries):
+            request_ids_seen: set[int] = set()
+            request_scale: float | None = None
+            for lora_request, scale in request_entries:
+                if lora_request is None or math.isclose(scale, 0.0):
+                    continue
+                if request_scale is None:
+                    request_scale = float(scale)
+                elif not math.isclose(request_scale, scale):
+                    raise ValueError(
+                        f"request {request_index} must use one LoRA scale"
+                    )
+                adapter_id = (
+                    int(lora_request)
+                    if isinstance(lora_request, int)
+                    else int(lora_request.lora_int_id)
+                )
+                if adapter_id in request_ids_seen:
+                    raise ValueError(
+                        f"request {request_index} repeats adapter {adapter_id}"
+                    )
+                request_ids_seen.add(adapter_id)
+                requested_scales.setdefault(adapter_id, 1.0)
+
+        if len(requested_scales) > self.max_gpu_loras:
+            raise ValueError(
+                "scheduled distinct LoRA adapters exceed GPU LoRA slots: "
+                f"{len(requested_scales)} > {self.max_gpu_loras}"
+            )
+        for adapter_id in requested_scales:
+            if adapter_id not in self._registered_adapters:
+                raise ValueError(f"Adapter {adapter_id} is not registered")
+
+        protected_adapter_ids = set(requested_scales)
+        adapter_to_slot: dict[int, int] = {}
+        for adapter_id in requested_scales:
+            slot_index = next(
+                (
+                    index
+                    for index, resident_id in self._gpu_slot_adapters.items()
+                    if resident_id == adapter_id
+                ),
+                None,
+            )
+            if slot_index is None:
+                slot_index = self._swap_adapter_into_gpu_slot(
+                    adapter_id, 1.0, protected_adapter_ids
+                )
+            elif not math.isclose(
+                self._gpu_slot_scales.get(slot_index, 1.0), 1.0
+            ):
+                self._load_adapter_into_gpu_slot(adapter_id, slot_index, 1.0)
+            adapter_to_slot[adapter_id] = slot_index
+            self._touch_adapter_info(adapter_id)
+            self._touch_gpu_slot(slot_index)
+
+        composition = tuple(
+            tuple(
+                (
+                    adapter_to_slot[
+                        (
+                            int(lora_request)
+                            if isinstance(lora_request, int)
+                            else int(lora_request.lora_int_id)
+                        )
+                    ],
+                    float(scale),
+                )
+                for lora_request, scale in request_entries
+                if lora_request is not None and not math.isclose(scale, 0.0)
+            )
+            for request_entries in entries
+        )
+        for lora_layer in self._lora_modules.values():
+            setter = getattr(lora_layer, "set_batch_adapter_composition", None)
+            if setter is None:
+                raise RuntimeError(
+                    "all diffusion LoRA layers must support composition mapping"
+                )
+            setter(composition)
+
+        payload = {
+            "request_ids": list(request_ids),
+            "compositions": [list(items) for items in composition],
+            "unique_adapter_ids": sorted(requested_scales),
+            "unique_slot_indices": sorted(set(adapter_to_slot.values())),
+            "hbm": cuda_memory_snapshot(self.device),
+        }
+        emit_event("lora_events", "lora_composition_mapping", **payload)
         return payload
 
     def _deactivate_all_adapters(self) -> None:
@@ -1034,6 +1146,7 @@ class DiffusionLoRAManager:
             for lora_layer in self._lora_modules.values():
                 lora_layer.reset_lora(slot_index)
             self._gpu_slot_adapters.pop(slot_index, None)
+            self._gpu_slot_scales.pop(slot_index, None)
             self._gpu_slot_access_order.pop(slot_index, None)
 
         del self._registered_adapters[adapter_id]

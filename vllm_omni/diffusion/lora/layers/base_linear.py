@@ -7,6 +7,11 @@ import os
 import re
 
 import torch
+from vllm.lora.multi_lora import (
+    MultiLoRAAdapter,
+    execute_lora,
+    prepare_lora_batch,
+)
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
 from vllm_omni.diffusion.experiment_telemetry import emit_event, tensor_metadata
 from vllm_omni.diffusion.lora.lora_compute_breakdown import (
@@ -14,6 +19,12 @@ from vllm_omni.diffusion.lora.lora_compute_breakdown import (
     record_lora_flops,
     start_interval,
 )
+
+
+def _multi_lora_operator_enabled() -> bool:
+    value = os.environ.get("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     """
@@ -100,7 +111,110 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     def set_batch_slot_indices(self, slot_indices: tuple[int | None, ...]) -> None:
         """Set one active LoRA slot per logical request in the next forward."""
         self._diffusion_lora_batch_slot_indices = tuple(slot_indices)
+        self._diffusion_lora_batch_composition = tuple(
+            () if slot is None else ((int(slot), 1.0),)
+            for slot in slot_indices
+        )
         self._diffusion_lora_batch_usage_emitted = False
+
+    def set_batch_adapter_composition(
+        self,
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> None:
+        """Set ordered resident adapter slots for every request in a batch."""
+        normalized: list[tuple[tuple[int, float], ...]] = []
+        for request_index, entries in enumerate(composition):
+            request_entries: list[tuple[int, float]] = []
+            seen_slots: set[int] = set()
+            for slot, scale in entries:
+                slot = int(slot)
+                scale = float(scale)
+                if slot < 0:
+                    raise ValueError(
+                        f"Multi-LoRA slot must be non-negative: request={request_index}"
+                    )
+                if slot in seen_slots:
+                    raise ValueError(
+                        f"duplicate Multi-LoRA slot {slot} in request "
+                        f"{request_index}"
+                    )
+                seen_slots.add(slot)
+                request_entries.append((slot, scale))
+            if request_entries and any(
+                scale != request_entries[0][1] for _, scale in request_entries
+            ):
+                raise ValueError(
+                    "Multi-LoRA request entries must share one request scale"
+                )
+            normalized.append(tuple(request_entries))
+        self._diffusion_lora_batch_composition = tuple(normalized)
+        self._diffusion_lora_batch_slot_indices = tuple(
+            entries[0][0] if len(entries) == 1 else None
+            for entries in self._diffusion_lora_batch_composition
+        )
+        self._diffusion_lora_batch_usage_emitted = False
+
+    def _apply_multi_lora_operator(
+        self,
+        module_name: str,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> torch.Tensor:
+        if not composition or not any(composition):
+            return y_flat
+        if x_flat.shape[0] % len(composition):
+            raise ValueError(
+                "Multi-LoRA composition does not divide flattened activations: "
+                f"rows={x_flat.shape[0]}, requests={len(composition)}"
+            )
+        rows_per_request = x_flat.shape[0] // len(composition)
+        for slice_index, slice_size in enumerate(output_slices):
+            if (
+                slice_index < len(self._diffusion_lora_active_slices)
+                and not self._diffusion_lora_active_slices[slice_index]
+            ):
+                continue
+            a_stack = self.lora_a_stacked[slice_index]
+            b_stack = self.lora_b_stacked[slice_index]
+            registry: dict[int, MultiLoRAAdapter] = {}
+            relation: list[list[int]] = []
+            for entries in composition:
+                request_relation: list[int] = []
+                for slot, _scale in entries:
+                    if slot >= a_stack.shape[0]:
+                        raise ValueError(
+                            f"Multi-LoRA slot {slot} exceeds layer capacity "
+                            f"{a_stack.shape[0]}"
+                        )
+                    request_relation.append(slot)
+                    if slot not in registry:
+                        registry[slot] = MultiLoRAAdapter(
+                            adapter_id=slot,
+                            lora_a=a_stack[slot, 0],
+                            lora_b=b_stack[slot, 0],
+                        )
+                relation.append(request_relation)
+            request_scales = [
+                entries[0][1] if len(entries) == 1 else 1.0
+                for entries in composition
+            ]
+            plan = prepare_lora_batch(
+                module_identity=f"{module_name}[slice={slice_index}]",
+                input_row_layout=(rows_per_request,) * len(composition),
+                request_to_adapter_relation=relation,
+                adapter_registry_snapshot=registry,
+                request_scales=request_scales,
+                execution_ownership=f"tp={self.tp_rank}/{self.tp_size}",
+            )
+            output_offset = sum(output_slices[:slice_index])
+            execute_lora(
+                x_flat,
+                y_flat[:, output_offset : output_offset + slice_size],
+                plan,
+            )
+        return y_flat
 
     def _apply_split_lora(
         self,
@@ -305,15 +419,39 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 f"lora_b_stacked={len(self.lora_b_stacked)}"
             )
 
+        composition = getattr(self, "_diffusion_lora_batch_composition", None)
         batch_slot_indices = getattr(
             self, "_diffusion_lora_batch_slot_indices", None
         )
         if batch_slot_indices is None:
             batch_slot_indices = (None,)
-        if not batch_slot_indices or all(
-            slot is None for slot in batch_slot_indices
+        if composition is None and (
+            not batch_slot_indices or all(slot is None for slot in batch_slot_indices)
         ):
             return output
+        if composition is not None and (not composition or not any(composition)):
+            return output
+        if _multi_lora_operator_enabled() and composition is not None:
+            lora_path_interval = start_interval(
+                "lora_path_e2e",
+                module_name=module_name,
+                execution_location="multi_lora_operator",
+                input_shape=list(x_flat.shape),
+                output_shape=list(y_flat.shape),
+            )
+            y_flat = self._apply_multi_lora_operator(
+                str(module_name),
+                x_flat,
+                y_flat,
+                tuple(int(size) for size in output_slices),
+                tuple(composition),
+            )
+            finish_interval(
+                lora_path_interval,
+                execution_location="multi_lora_operator",
+                output_shape=list(y_flat.shape),
+            )
+            return y_flat.view(original_shape)
 
         lora_path_interval = start_interval(
             "lora_path_e2e",
