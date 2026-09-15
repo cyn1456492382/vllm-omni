@@ -298,7 +298,10 @@ class BaseScheduler(ABC):
         lora_request = getattr(sampling, "lora_request", None)
         lora_int_id = (
             None
-            if getattr(self.od_config, "enable_mixed_lora_batch", False)
+            if (
+                getattr(self.od_config, "enable_mixed_lora_batch", False)
+                or getattr(self.od_config, "step_execution", False)
+            )
             else (lora_request.lora_int_id if lora_request is not None else None)
         )
         return StepBatchSamplingParamsKey(

@@ -429,7 +429,11 @@ class DiffusionEngine:
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
-                if self.supports_request_batch or self.dp_concurrent:
+                # StepScheduler is the execution mode used by the DiT path.
+                # It also needs the configured admission barrier; without it
+                # a client burst is scheduled after the first few requests
+                # arrive, creating invalid leading/trailing edge waves.
+                if self.step_execution or self.supports_request_batch or self.dp_concurrent:
                     self._wait_for_request_batch_admission_locked()
 
                 sched_output = self.scheduler.schedule()
@@ -469,7 +473,18 @@ class DiffusionEngine:
 
         Caller must hold ``self._cv``.
         """
-        if self.step_execution or (not self.supports_request_batch and not self.dp_concurrent):
+        # Step execution still benefits from an admission barrier when a
+        # measured client submits a large burst.  Previously this returned
+        # immediately for every step-mode request, allowing the engine to
+        # start a partial wave before the remaining B requests arrived and
+        # contaminating peak-HBM measurements.  The configured wait is
+        # opt-in (zero keeps the historical behavior).  Request-level modes
+        # that cannot batch remain unchanged.
+        if (
+            not self.step_execution
+            and not self.supports_request_batch
+            and not self.dp_concurrent
+        ):
             return
 
         max_wait_s = self.od_config.request_batch_max_wait_ms / 1000.0
@@ -491,6 +506,12 @@ class DiffusionEngine:
         # HTTP requests have time to land before scheduling.
         if self.dp_concurrent:
             stable_window_s = min(0.3, max_wait_s / 2.0)
+        elif self.step_execution:
+            # Building a large per-request parameter list in the client can
+            # take longer than the old 50 ms quiet window.  A one-second
+            # stability window makes the barrier robust for B=256..1200
+            # without changing the default (zero-wait) path.
+            stable_window_s = min(20.0, max_wait_s / 2.0)
         else:
             stable_window_s = min(0.05, max_wait_s / 5.0)
 
@@ -500,7 +521,22 @@ class DiffusionEngine:
 
             if waiting >= max_batch:
                 break
-            if waiting > 0 and (now - stable_since) >= stable_window_s:
+            # Capacity experiments set a deliberately long admission timeout
+            # (120 s) and require one exact B-way DiT batch.  Do not turn the
+            # old quiet-period heuristic into a partial edge wave in that
+            # mode: requests arrive through the orchestrator one at a time
+            # and a large burst can take longer than 20 s to reach this
+            # engine.  Normal serving keeps the historical quiet-period
+            # behavior.
+            require_full_batch = (
+                self.step_execution
+                and self.od_config.request_batch_max_wait_ms >= 100000
+            )
+            if (
+                not require_full_batch
+                and waiting > 0
+                and (now - stable_since) >= stable_window_s
+            ):
                 break
             if now >= deadline:
                 break

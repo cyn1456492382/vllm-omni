@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import re
 import time
 from collections import OrderedDict
 from typing import get_args
@@ -368,6 +369,42 @@ class DiffusionLoRAManager:
 
         for lora in lora_model.loras.values():
             lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
+
+        # Capacity-boundary scans may need more distinct adapters than can be
+        # materialized as full checkpoint files.  The runner marks these
+        # requests explicitly.  Derive a deterministic variant in CPU memory
+        # by sign-flipping a stable subset of B rows.  A/B shapes, rank,
+        # dtype, and therefore GPU slot residency are unchanged, while every
+        # adapter ID has distinct tensor content and remains independently
+        # mapped during the measured mixed-LoRA batch.
+        virtual_match = re.fullmatch(
+            r"capacity_virtual_distill_(\d+)", str(lora_request.lora_name)
+        )
+        if virtual_match is not None:
+            variant_id = int(virtual_match.group(1))
+            period = 7 + (variant_id % 23)
+            for lora in lora_model.loras.values():
+                if isinstance(lora, PackedLoRALayerWeights):
+                    b_values = list(lora.lora_b)
+                    for index, value in enumerate(b_values):
+                        if value is None:
+                            continue
+                        derived = value.clone()
+                        rows = torch.arange(
+                            derived.shape[0], dtype=torch.int64, device=derived.device
+                        )
+                        selected = ((rows + variant_id) % period) == 0
+                        derived[selected] = -derived[selected]
+                        b_values[index] = derived
+                    lora.lora_b = b_values
+                elif lora.lora_b is not None:
+                    derived = lora.lora_b.clone()
+                    rows = torch.arange(
+                        derived.shape[0], dtype=torch.int64, device=derived.device
+                    )
+                    selected = ((rows + variant_id) % period) == 0
+                    derived[selected] = -derived[selected]
+                    lora.lora_b = derived
 
         return lora_model, peft_helper
 
