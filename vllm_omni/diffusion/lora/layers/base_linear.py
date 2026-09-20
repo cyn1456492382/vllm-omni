@@ -9,10 +9,20 @@ import re
 import torch
 from vllm.lora.multi_lora import (
     MultiLoRAAdapter,
+    execute_fused_lora,
+    execute_tiled_fused_lora,
     execute_lora,
     prepare_lora_batch,
 )
 from vllm.lora.layers.base_linear import BaseLinearLayerWithLoRA
+from vllm.lora.ops.triton_ops import (
+    LoRAKernelMeta,
+    lora_expand,
+    lora_shrink,
+)
+from vllm.lora.ops.triton_ops.multi_lora_tile_plan import (
+    build_multi_lora_tile_plan,
+)
 from vllm_omni.diffusion.experiment_telemetry import emit_event, tensor_metadata
 from vllm_omni.diffusion.lora.lora_compute_breakdown import (
     finish_interval,
@@ -24,6 +34,13 @@ from vllm_omni.diffusion.lora.lora_compute_breakdown import (
 def _multi_lora_operator_enabled() -> bool:
     value = os.environ.get("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lora_diagnostic_mode() -> str:
+    enabled = os.environ.get("VLLM_OMNI_ENABLE_LORA_DIAGNOSTIC", "")
+    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+        return "normal"
+    return os.environ.get("VLLM_OMNI_LORA_DIAGNOSTIC_MODE", "normal").strip().lower()
 
 
 class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
@@ -80,11 +97,19 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         object.__setattr__(self, "_diffusion_base_layer_ref", base_layer)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        self._diffusion_lora_slot_ranks_by_slice = tuple(
+            [0] * int(max_loras) for _ in range(int(n_slices))
+        )
+        self._diffusion_lora_batch_row_layout = None
 
     def reset_lora(self, index: int):
         super().reset_lora(index)
         n_slices = getattr(self, "n_slices", 1)
         self._diffusion_lora_active_slices = (False,) * int(n_slices)
+        rank_tables = getattr(self, "_diffusion_lora_slot_ranks_by_slice", None)
+        if rank_tables is not None:
+            for ranks in rank_tables:
+                ranks[index] = 0
 
     def set_lora(
         self,
@@ -104,9 +129,22 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             if len(active_slices) < n_slices:
                 active_slices.extend([False] * (n_slices - len(active_slices)))
             self._diffusion_lora_active_slices = tuple(active_slices)
+            rank_tables = getattr(
+                self, "_diffusion_lora_slot_ranks_by_slice", None
+            )
+            if rank_tables is not None:
+                for slice_index, a_i in enumerate(lora_a[:n_slices]):
+                    rank_tables[slice_index][index] = (
+                        0 if a_i is None else int(a_i.shape[0])
+                    )
         else:
             # Single-slice layer.
             self._diffusion_lora_active_slices = (True,)
+            rank_tables = getattr(
+                self, "_diffusion_lora_slot_ranks_by_slice", None
+            )
+            if rank_tables is not None:
+                rank_tables[0][index] = int(lora_a.shape[0])
 
     def set_batch_slot_indices(self, slot_indices: tuple[int | None, ...]) -> None:
         """Set one active LoRA slot per logical request in the next forward."""
@@ -115,13 +153,24 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             () if slot is None else ((int(slot), 1.0),)
             for slot in slot_indices
         )
+        self._diffusion_lora_batch_row_layout = None
         self._diffusion_lora_batch_usage_emitted = False
 
     def set_batch_adapter_composition(
         self,
         composition: tuple[tuple[tuple[int, float], ...], ...],
+        row_layout: tuple[int, ...] | None = None,
     ) -> None:
         """Set ordered resident adapter slots for every request in a batch."""
+        if row_layout is not None:
+            row_layout = tuple(int(rows) for rows in row_layout)
+            if len(row_layout) != len(composition):
+                raise ValueError(
+                    "Multi-LoRA row layout and composition must have equal "
+                    f"request counts: {len(row_layout)} != {len(composition)}"
+                )
+            if any(rows < 0 for rows in row_layout):
+                raise ValueError("Multi-LoRA row counts must be non-negative")
         normalized: list[tuple[tuple[int, float], ...]] = []
         for request_index, entries in enumerate(composition):
             request_entries: list[tuple[int, float]] = []
@@ -140,19 +189,48 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                     )
                 seen_slots.add(slot)
                 request_entries.append((slot, scale))
-            if request_entries and any(
-                scale != request_entries[0][1] for _, scale in request_entries
-            ):
-                raise ValueError(
-                    "Multi-LoRA request entries must share one request scale"
-                )
             normalized.append(tuple(request_entries))
         self._diffusion_lora_batch_composition = tuple(normalized)
         self._diffusion_lora_batch_slot_indices = tuple(
             entries[0][0] if len(entries) == 1 else None
             for entries in self._diffusion_lora_batch_composition
         )
+        self._diffusion_lora_batch_row_layout = row_layout
         self._diffusion_lora_batch_usage_emitted = False
+
+    def set_batch_request_layout(self, row_layout: tuple[int, ...]) -> None:
+        """Set flattened activation rows owned by each logical request."""
+        normalized = tuple(int(rows) for rows in row_layout)
+        composition = getattr(self, "_diffusion_lora_batch_composition", None)
+        if composition is None or len(normalized) != len(composition):
+            raise ValueError(
+                "Multi-LoRA row layout must match the active request composition"
+            )
+        if any(rows < 0 for rows in normalized):
+            raise ValueError("Multi-LoRA row counts must be non-negative")
+        self._diffusion_lora_batch_row_layout = normalized
+
+    def _get_batch_row_layout(
+        self,
+        x_flat: torch.Tensor,
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> tuple[int, ...]:
+        configured = getattr(self, "_diffusion_lora_batch_row_layout", None)
+        if configured is None:
+            if x_flat.shape[0] % len(composition):
+                raise ValueError(
+                    "Multi-LoRA composition requires an explicit ragged row "
+                    "layout when flattened activations are not uniform: "
+                    f"rows={x_flat.shape[0]}, requests={len(composition)}"
+                )
+            rows = x_flat.shape[0] // len(composition)
+            return (rows,) * len(composition)
+        if len(configured) == len(composition) and sum(configured) == x_flat.shape[0]:
+            return configured
+        raise ValueError(
+            "Multi-LoRA row layout does not match flattened activations: "
+            f"layout={configured}, rows={x_flat.shape[0]}"
+        )
 
     def _apply_multi_lora_operator(
         self,
@@ -164,12 +242,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
     ) -> torch.Tensor:
         if not composition or not any(composition):
             return y_flat
-        if x_flat.shape[0] % len(composition):
-            raise ValueError(
-                "Multi-LoRA composition does not divide flattened activations: "
-                f"rows={x_flat.shape[0]}, requests={len(composition)}"
-            )
-        rows_per_request = x_flat.shape[0] // len(composition)
+        row_layout = self._get_batch_row_layout(x_flat, composition)
         for slice_index, slice_size in enumerate(output_slices):
             if (
                 slice_index < len(self._diffusion_lora_active_slices)
@@ -197,16 +270,18 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                         )
                 relation.append(request_relation)
             request_scales = [
-                entries[0][1] if len(entries) == 1 else 1.0
-                for entries in composition
+                [scale for _slot, scale in entries] for entries in composition
             ]
             plan = prepare_lora_batch(
                 module_identity=f"{module_name}[slice={slice_index}]",
-                input_row_layout=(rows_per_request,) * len(composition),
+                input_row_layout=row_layout,
                 request_to_adapter_relation=relation,
                 adapter_registry_snapshot=registry,
                 request_scales=request_scales,
-                execution_ownership=f"tp={self.tp_rank}/{self.tp_size}",
+                execution_ownership=(
+                    f"tp={getattr(self, 'tp_rank', 0)}/"
+                    f"{getattr(self, 'tp_size', 1)}"
+                ),
             )
             output_offset = sum(output_slices[:slice_index])
             execute_lora(
@@ -216,6 +291,263 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             )
         return y_flat
 
+    @torch.compiler.disable
+    def _apply_sequential_multi_lora(
+        self,
+        module_name: str,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> torch.Tensor:
+        row_layout = self._get_batch_row_layout(x_flat, composition)
+        row_start = 0
+        request_adapter_counts: list[int] = []
+        for request_index, (row_count, entries) in enumerate(
+            zip(row_layout, composition)
+        ):
+            row_end = row_start + row_count
+            request_input = x_flat[row_start:row_end]
+            request_output = y_flat[row_start:row_end]
+            applied_count = 0
+            for slot_index, scale in entries:
+                output_offset = 0
+                for slice_index, slice_size in enumerate(output_slices):
+                    if (
+                        slice_index < len(self._diffusion_lora_active_slices)
+                        and not self._diffusion_lora_active_slices[slice_index]
+                    ):
+                        output_offset += slice_size
+                        continue
+                    lora_a = self.lora_a_stacked[slice_index][slot_index, 0]
+                    lora_b = self.lora_b_stacked[slice_index][slot_index, 0]
+                    if lora_a.shape[0] <= 0 or lora_b.shape[1] <= 0:
+                        raise ValueError(
+                            "referenced LoRA adapter must have positive rank"
+                        )
+                    hidden = request_input @ lora_a.transpose(0, 1)
+                    delta = hidden @ lora_b.transpose(0, 1)
+                    current = request_output[:, output_offset : output_offset + slice_size]
+                    request_output[:, output_offset : output_offset + slice_size] = (
+                        current + delta.to(dtype=current.dtype) * float(scale)
+                    )
+                    output_offset += slice_size
+                applied_count += 1
+                emit_event(
+                    "lora_events",
+                    "sequential_adapter_applied",
+                    module_name=module_name,
+                    request_index=request_index,
+                    slot_index=int(slot_index),
+                    scale=float(scale),
+                )
+            request_adapter_counts.append(applied_count)
+            row_start = row_end
+        emit_event(
+            "lora_events",
+            "sequential_summary",
+            module_name=module_name,
+            request_adapter_counts=request_adapter_counts,
+            adapters_applied_count=sum(request_adapter_counts),
+        )
+        return y_flat
+
+    @torch.compiler.disable
+    def _apply_punica_segmented(
+        self,
+        module_name: str,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> torch.Tensor:
+        row_layout = self._get_batch_row_layout(x_flat, composition)
+        total_rows = int(x_flat.shape[0])
+        x_work = x_flat if x_flat.is_contiguous() else x_flat.contiguous()
+        request_indices = torch.repeat_interleave(
+            torch.arange(len(row_layout), device=x_flat.device),
+            torch.tensor(row_layout, device=x_flat.device, dtype=torch.long),
+        )
+        segment_rows = tuple(
+            (request_index, int(slot), float(scale))
+            for request_index, entries in enumerate(composition)
+            for slot, scale in entries
+        )
+
+        shrink_calls = 0
+        expand_calls = 0
+        segment_count = 0
+        for slice_index, slice_size in enumerate(output_slices):
+            if (
+                slice_index < len(self._diffusion_lora_active_slices)
+                and not self._diffusion_lora_active_slices[slice_index]
+            ):
+                continue
+            a_stack = self.lora_a_stacked[slice_index]
+            b_stack = self.lora_b_stacked[slice_index]
+            if not a_stack.is_contiguous():
+                a_stack = a_stack.contiguous()
+            if not b_stack.is_contiguous():
+                b_stack = b_stack.contiguous()
+            rank = int(a_stack.shape[2])
+            if rank <= 0:
+                raise ValueError("referenced LoRA adapter must have positive rank")
+            output_offset = sum(output_slices[:slice_index])
+            for request_index, slot_index, scale in segment_rows:
+                rows = request_indices == request_index
+                if not torch.any(rows):
+                    continue
+                token_lora_mapping = torch.full(
+                    (total_rows,),
+                    -1,
+                    dtype=torch.int32,
+                    device=x_flat.device,
+                )
+                row_index_tensor = rows.nonzero(as_tuple=False).flatten()
+                token_lora_mapping.index_fill_(0, row_index_tensor, slot_index)
+                metadata = LoRAKernelMeta.make(
+                    max_loras=int(a_stack.shape[0]),
+                    max_num_tokens=total_rows,
+                    device=x_flat.device,
+                )
+                metadata.prepare_tensors(token_lora_mapping)
+                shrink_buffer = torch.empty(
+                    (1, total_rows, rank),
+                    dtype=torch.float32,
+                    device=x_flat.device,
+                )
+                lora_shrink(
+                    x_work,
+                    [a_stack],
+                    shrink_buffer,
+                    *metadata.meta_args(total_rows, False),
+                    float(scale),
+                )
+                shrink_calls += 1
+                lora_expand(
+                    shrink_buffer,
+                    [b_stack],
+                    y_flat,
+                    *metadata.meta_args(total_rows, False),
+                    offset_start=output_offset,
+                    add_inputs=True,
+                )
+                expand_calls += 1
+                segment_count += 1
+                emit_event(
+                    "lora_events",
+                    "punica_segmented_call",
+                    module_name=module_name,
+                    slice_index=slice_index,
+                    slice_size=int(slice_size),
+                    slot_index=slot_index,
+                    scale=scale,
+                    token_count=int(row_index_tensor.numel()),
+                    punica_shrink_calls=1,
+                    punica_expand_calls=1,
+                )
+        emit_event(
+            "lora_events",
+            "punica_segmented_summary",
+            module_name=module_name,
+            punica_shrink_calls=shrink_calls,
+            punica_expand_calls=expand_calls,
+            segment_count=segment_count,
+        )
+        return y_flat
+
+    def _apply_punica_style_reference(
+        self,
+        module_name: str,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+    ) -> torch.Tensor:
+        return self._apply_multi_lora_operator(
+            module_name, x_flat, y_flat, output_slices, composition
+        )
+
+    def _apply_fused_multi_lora_operator(
+        self,
+        x_flat: torch.Tensor,
+        y_flat: torch.Tensor,
+        output_slices: tuple[int, ...],
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+        implementation: str,
+    ) -> torch.Tensor:
+        row_layout = self._get_batch_row_layout(x_flat, composition)
+        rank_tables = getattr(
+            self, "_diffusion_lora_slot_ranks_by_slice", None
+        )
+        if rank_tables is None:
+            raise RuntimeError("LoRA rank metadata was not initialized")
+        relations = tuple(
+            tuple(slot for slot, _ in entries) for entries in composition
+        )
+        scales = tuple(
+            tuple(scale for _, scale in entries) for entries in composition
+        )
+        tile_plan_cache = getattr(self, "_diffusion_lora_tile_plan_cache", None)
+        if tile_plan_cache is None:
+            tile_plan_cache = {}
+            self._diffusion_lora_tile_plan_cache = tile_plan_cache
+        for slice_index, slice_size in enumerate(output_slices):
+            if (
+                slice_index < len(self._diffusion_lora_active_slices)
+                and not self._diffusion_lora_active_slices[slice_index]
+            ):
+                continue
+            output_start = sum(output_slices[:slice_index])
+            output_view = y_flat[:, output_start : output_start + slice_size]
+            if implementation == "tile_fused":
+                rank_table = rank_tables[slice_index]
+                rank_signature = tuple(int(rank) for rank in rank_table)
+                cache_key = (
+                    slice_index,
+                    row_layout,
+                    composition,
+                    int(slice_size),
+                    x_flat.device,
+                    rank_signature,
+                )
+                tile_plan = tile_plan_cache.get(cache_key)
+                if tile_plan is None:
+                    if len(tile_plan_cache) >= 64:
+                        tile_plan_cache.clear()
+                    tile_plan = build_multi_lora_tile_plan(
+                        row_layout,
+                        relations,
+                        scales,
+                        rank_signature,
+                        int(slice_size),
+                        x_flat.device,
+                    )
+                    tile_plan_cache[cache_key] = tile_plan
+                execute_tiled_fused_lora(
+                    x_flat,
+                    output_view,
+                    self.lora_a_stacked[slice_index],
+                    self.lora_b_stacked[slice_index],
+                    row_layout,
+                    relations,
+                    scales,
+                    rank_table,
+                    tile_plan=tile_plan,
+                )
+            else:
+                execute_fused_lora(
+                    x_flat,
+                    output_view,
+                    self.lora_a_stacked[slice_index],
+                    self.lora_b_stacked[slice_index],
+                    row_layout,
+                    relations,
+                    scales,
+                    rank_tables[slice_index],
+                )
+        return y_flat
+
     def _apply_split_lora(
         self,
         module_name: str,
@@ -223,6 +555,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         y_flat: torch.Tensor,
         output_slices: tuple[int, ...],
         batch_slot_indices: tuple[int | None, ...],
+        row_layout: tuple[int, ...] | None = None,
     ) -> torch.Tensor | None:
         try:
             from vllm_omni.diffusion.lora.edge_dit_lora_runtime import (
@@ -245,13 +578,41 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         if not split_records:
             return None
 
+        for slot_index in batch_slot_indices:
+            if slot_index is None:
+                continue
+            if not 0 <= int(slot_index) < self.lora_a_stacked[0].shape[0]:
+                raise ValueError(f"LoRA slot {slot_index} is outside resident storage")
+            for a_stack, b_stack in zip(
+                self.lora_a_stacked, self.lora_b_stacked
+            ):
+                if a_stack[slot_index, 0].shape[0] <= 0 or b_stack[slot_index, 0].shape[1] <= 0:
+                    raise ValueError(
+                        "referenced LoRA adapter must have positive rank"
+                    )
+
+        row_counts = tuple(
+            row_layout
+            if row_layout is not None
+            else (x_flat.shape[0] // len(batch_slot_indices),)
+            * len(batch_slot_indices)
+        )
+        if sum(row_counts) != x_flat.shape[0]:
+            raise ValueError(
+                "legacy LoRA row layout does not cover flattened activations: "
+                f"layout={row_counts}, rows={x_flat.shape[0]}"
+            )
         row_slot_indices = torch.repeat_interleave(
             torch.tensor(
                 [slot if slot is not None else -1 for slot in batch_slot_indices],
                 device=x_flat.device,
                 dtype=torch.long,
             ),
-            x_flat.shape[0] // len(batch_slot_indices),
+            torch.tensor(
+                row_counts,
+                device=x_flat.device,
+                dtype=torch.long,
+            ),
         )
         hidden_offset = 0
         output_offset = 0
@@ -424,14 +785,25 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             self, "_diffusion_lora_batch_slot_indices", None
         )
         if batch_slot_indices is None:
-            batch_slot_indices = (None,)
+            batch_slot_indices = (0,)
         if composition is None and (
             not batch_slot_indices or all(slot is None for slot in batch_slot_indices)
         ):
             return output
         if composition is not None and (not composition or not any(composition)):
             return output
-        if _multi_lora_operator_enabled() and composition is not None:
+        operator_enabled = _multi_lora_operator_enabled()
+        if composition is not None and any(len(entries) > 1 for entries in composition):
+            if not operator_enabled:
+                raise RuntimeError(
+                    "Multi-LoRA composition with K>1 requires "
+                    "VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR=1"
+                )
+        if composition is not None and not operator_enabled:
+            batch_slot_indices = tuple(
+                entries[0][0] if entries else None for entries in composition
+            )
+        if operator_enabled and composition is not None:
             lora_path_interval = start_interval(
                 "lora_path_e2e",
                 module_name=module_name,
@@ -439,13 +811,52 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 input_shape=list(x_flat.shape),
                 output_shape=list(y_flat.shape),
             )
-            y_flat = self._apply_multi_lora_operator(
-                str(module_name),
-                x_flat,
-                y_flat,
-                tuple(int(size) for size in output_slices),
-                tuple(composition),
-            )
+            implementation = os.environ.get(
+                "VLLM_OMNI_MULTI_LORA_IMPL", "fused"
+            ).strip().lower()
+            if implementation == "sequential":
+                raise ValueError(
+                    "VLLM_OMNI_MULTI_LORA_IMPL=sequential is reserved for "
+                    "request-level serial transport; use torch for the "
+                    "request-internal operator"
+                )
+            elif implementation == "punica_segmented":
+                y_flat = self._apply_punica_segmented(
+                    str(module_name),
+                    x_flat,
+                    y_flat,
+                    tuple(int(size) for size in output_slices),
+                    tuple(composition),
+                )
+            elif implementation == "punica_ref":
+                y_flat = self._apply_punica_style_reference(
+                    str(module_name),
+                    x_flat,
+                    y_flat,
+                    tuple(int(size) for size in output_slices),
+                    tuple(composition),
+                )
+            elif implementation == "torch":
+                y_flat = self._apply_multi_lora_operator(
+                    str(module_name),
+                    x_flat,
+                    y_flat,
+                    tuple(int(size) for size in output_slices),
+                    tuple(composition),
+                )
+            elif implementation in {"fused", "tile_fused"}:
+                y_flat = self._apply_fused_multi_lora_operator(
+                    x_flat,
+                    y_flat,
+                    tuple(int(size) for size in output_slices),
+                    tuple(composition),
+                    implementation,
+                )
+            else:
+                raise ValueError(
+                    "unsupported VLLM_OMNI_MULTI_LORA_IMPL: "
+                    f"{implementation}"
+                )
             finish_interval(
                 lora_path_interval,
                 execution_location="multi_lora_operator",
@@ -461,12 +872,18 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             output_shape=list(y_flat.shape),
         )
 
+        legacy_row_layout = (
+            self._get_batch_row_layout(x_flat, composition)
+            if composition is not None
+            else None
+        )
         split_output = self._apply_split_lora(
             str(module_name),
             x_flat,
             y_flat,
             tuple(int(size) for size in output_slices),
             tuple(batch_slot_indices),
+            legacy_row_layout,
         )
         if split_output is not None:
             finish_interval(
@@ -475,9 +892,7 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 output_shape=list(split_output.shape),
             )
             return split_output.view(original_shape)
-        diagnostic_mode = os.environ.get(
-            "VLLM_OMNI_LORA_DIAGNOSTIC_MODE", "normal"
-        ).strip().lower()
+        diagnostic_mode = _lora_diagnostic_mode()
         if diagnostic_mode not in {
             "normal",
             "route_only",

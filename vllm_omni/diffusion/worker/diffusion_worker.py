@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -221,6 +222,7 @@ class DiffusionWorker:
         self._step_lora_composition_state: dict[
             str, tuple[tuple[LoRARequest | int, float], ...]
         ] = {}
+        self._step_lora_row_layout_state: dict[str, tuple[int, ...] | None] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
@@ -480,6 +482,7 @@ class DiffusionWorker:
                     self.lora_manager.set_batch_adapter_composition_mapping(
                         [list(composition)],
                         [getattr(req, "request_id", "req0")],
+                        row_layout=self._get_request_row_layout(req.sampling_params),
                     )
                 else:
                     self.lora_manager.set_active_adapter(
@@ -521,7 +524,11 @@ class DiffusionWorker:
                     scheduler_output
                 )
                 self.lora_manager.set_batch_adapter_composition_mapping(
-                    compositions, request_ids
+                    compositions,
+                    request_ids,
+                    row_layout=self._get_scheduler_lora_row_layout(
+                        scheduler_output, request_ids
+                    ),
                 )
             elif getattr(od_config, "enable_mixed_lora_batch", False):
                 self.lora_manager.set_batch_adapter_mapping(entries, request_ids)
@@ -579,6 +586,7 @@ class DiffusionWorker:
         for request_id in scheduler_output.finished_req_ids:
             self._step_lora_state.pop(request_id, None)
             self._step_lora_composition_state.pop(request_id, None)
+            self._step_lora_row_layout_state.pop(request_id, None)
             if remove_edge_dit_lora_runtime_request is not None:
                 remove_edge_dit_lora_runtime_request(request_id)
 
@@ -593,6 +601,9 @@ class DiffusionWorker:
                 self._step_lora_composition_state.pop(new_req.request_id, None)
             else:
                 self._step_lora_composition_state[new_req.request_id] = composition
+            self._step_lora_row_layout_state[new_req.request_id] = (
+                self._get_request_row_layout(sampling)
+            )
 
         if self.lora_manager is None:
             return
@@ -611,7 +622,11 @@ class DiffusionWorker:
                     scheduler_output
                 )
                 self.lora_manager.set_batch_adapter_composition_mapping(
-                    compositions, request_ids
+                    compositions,
+                    request_ids,
+                    row_layout=self._get_scheduler_lora_row_layout(
+                        scheduler_output, request_ids
+                    ),
                 )
             elif getattr(self.od_config, "enable_mixed_lora_batch", False):
                 self.lora_manager.set_batch_adapter_mapping(entries, request_ids)
@@ -635,11 +650,15 @@ class DiffusionWorker:
         """Resolve LoRA requests for newly scheduled and cached request IDs."""
         for request_id in scheduler_output.finished_req_ids:
             self._step_lora_state.pop(request_id, None)
+            self._step_lora_row_layout_state.pop(request_id, None)
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
             self._step_lora_state[new_req.request_id] = (
                 sampling.lora_request,
                 sampling.lora_scale,
+            )
+            self._step_lora_row_layout_state[new_req.request_id] = (
+                self._get_request_row_layout(sampling)
             )
         request_ids = list(scheduler_output.scheduled_request_ids)
         entries = [
@@ -647,6 +666,43 @@ class DiffusionWorker:
             for request_id in request_ids
         ]
         return entries, request_ids
+
+    @staticmethod
+    def _get_request_row_layout(sampling_params: Any) -> tuple[int, ...] | None:
+        """Read an optional flattened activation row layout."""
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        if not isinstance(extra_args, dict):
+            return None
+        raw_layout = extra_args.get("lora_row_layout")
+        if raw_layout is None:
+            return None
+        if isinstance(raw_layout, int):
+            raw_layout = [raw_layout]
+        if not isinstance(raw_layout, (list, tuple)):
+            raise ValueError("lora_row_layout must be an integer sequence")
+        layout = tuple(int(rows) for rows in raw_layout)
+        if any(rows < 0 for rows in layout):
+            raise ValueError("lora_row_layout values must be non-negative")
+        return layout
+
+    def _get_scheduler_lora_row_layout(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        request_ids: list[str],
+    ) -> tuple[int, ...] | None:
+        """Resolve explicit row counts in scheduler order."""
+        del scheduler_output
+        layouts = [
+            self._step_lora_row_layout_state.get(request_id)
+            for request_id in request_ids
+        ]
+        if not layouts or all(layout is None for layout in layouts):
+            return None
+        if any(layout is None or len(layout) != 1 for layout in layouts):
+            raise ValueError(
+                "each scheduled request must provide one lora_row_layout entry"
+            )
+        return tuple(layout[0] for layout in layouts if layout is not None)
 
     @staticmethod
     def _multi_lora_operator_enabled() -> bool:
@@ -674,9 +730,22 @@ class DiffusionWorker:
                 raise ValueError(
                     "each multi_lora_adapters entry needs adapter_id"
                 )
-            composition.append(
-                (int(item["adapter_id"]), float(item.get("scale", 1.0)))
-            )
+            adapter_id = int(item["adapter_id"])
+            adapter_path = item.get("adapter_path")
+            if adapter_path is None:
+                adapter = adapter_id
+            else:
+                adapter_path = str(adapter_path)
+                if not adapter_path:
+                    raise ValueError("adapter_path must not be empty")
+                adapter = LoRARequest(
+                    lora_name=str(
+                        item.get("adapter_name") or Path(adapter_path).name
+                    ),
+                    lora_int_id=adapter_id,
+                    lora_path=adapter_path,
+                )
+            composition.append((adapter, float(item.get("scale", 1.0))))
         return tuple(composition)
 
     def _get_scheduler_lora_compositions(

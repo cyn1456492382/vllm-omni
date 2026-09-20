@@ -263,8 +263,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise RuntimeError("Diffusion model runner did not create a pipeline instance.")
         pipeline_name = type(self.pipeline).__name__
         transformer_name = type(getattr(self.pipeline, "transformer", object())).__name__
-        assert pipeline_name == "ZImagePipeline", f"Expected ZImagePipeline, got {pipeline_name}"
-        assert transformer_name == "ZImageTransformer2DModel", f"Expected ZImageTransformer2DModel, got {transformer_name}"
+        if pipeline_name == "ZImagePipeline":
+            assert transformer_name == "ZImageTransformer2DModel", (
+                f"Expected ZImageTransformer2DModel, got {transformer_name}"
+            )
+        elif pipeline_name in {"FluxPipeline", "FluxDMD2Pipeline"}:
+            assert transformer_name == "FluxTransformer2DModel", (
+                f"Expected FluxTransformer2DModel, got {transformer_name}"
+            )
 
         inventory = export_module_inventory(self.pipeline)
         if not inventory:

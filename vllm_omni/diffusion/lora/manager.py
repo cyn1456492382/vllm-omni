@@ -208,6 +208,28 @@ class DiffusionLoRAManager:
                         existing,
                     )
 
+            declared = getattr(module, "packed_modules_mapping", None)
+            if isinstance(declared, dict):
+                for packed_name, sub_names in declared.items():
+                    if not isinstance(packed_name, str) or not packed_name:
+                        continue
+                    if not isinstance(sub_names, (list, tuple)) or not all(
+                        isinstance(name, str) and name for name in sub_names
+                    ):
+                        continue
+                    existing = mapping.get(packed_name)
+                    declared_names = list(sub_names)
+                    if existing is None:
+                        mapping[packed_name] = declared_names
+                    elif existing != declared_names:
+                        logger.warning(
+                            "Conflicting packed module mapping for %s: %s vs %s; using %s",
+                            packed_name,
+                            existing,
+                            declared_names,
+                            existing,
+                        )
+
         return mapping
 
     def _get_packed_sublayer_suffixes(self, packed_module_suffix: str, n_slices: int) -> list[str] | None:
@@ -817,7 +839,9 @@ class DiffusionLoRAManager:
         self, slot_indices: tuple[int | None, ...]
     ) -> None:
         for lora_layer in self._lora_modules.values():
-            lora_layer.set_batch_slot_indices(slot_indices)
+            setter = getattr(lora_layer, "set_batch_slot_indices", None)
+            if setter is not None:
+                setter(slot_indices)
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
         if self._is_active_at_scale(adapter_id, scale):
@@ -938,6 +962,7 @@ class DiffusionLoRAManager:
         self,
         entries: list[list[tuple[LoRARequest | int | None, float]]],
         request_ids: list[str],
+        row_layout: tuple[int, ...] | None = None,
     ) -> dict[str, object]:
         """Publish ordered resident adapter compositions for a DiT batch.
 
@@ -947,6 +972,14 @@ class DiffusionLoRAManager:
         """
         if len(entries) != len(request_ids):
             raise ValueError("LoRA compositions and request IDs must match")
+        if row_layout is not None:
+            row_layout = tuple(int(rows) for rows in row_layout)
+            if len(row_layout) != len(entries):
+                raise ValueError(
+                    "LoRA row layout and request IDs must match"
+                )
+            if any(rows < 0 for rows in row_layout):
+                raise ValueError("LoRA row counts must be non-negative")
 
         requested_scales: dict[int, float] = {}
         for request_index, request_entries in enumerate(entries):
@@ -978,6 +1011,10 @@ class DiffusionLoRAManager:
                 "scheduled distinct LoRA adapters exceed GPU LoRA slots: "
                 f"{len(requested_scales)} > {self.max_gpu_loras}"
             )
+        for request_entries in entries:
+            for lora_request, _scale in request_entries:
+                if isinstance(lora_request, LoRARequest):
+                    self.add_adapter(lora_request)
         for adapter_id in requested_scales:
             if adapter_id not in self._registered_adapters:
                 raise ValueError(f"Adapter {adapter_id} is not registered")
@@ -1028,11 +1065,12 @@ class DiffusionLoRAManager:
                 raise RuntimeError(
                     "all diffusion LoRA layers must support composition mapping"
                 )
-            setter(composition)
+            setter(composition, row_layout=row_layout)
 
         payload = {
             "request_ids": list(request_ids),
             "compositions": [list(items) for items in composition],
+            "row_layout": None if row_layout is None else list(row_layout),
             "unique_adapter_ids": sorted(requested_scales),
             "unique_slot_indices": sorted(set(adapter_to_slot.values())),
             "hbm": cuda_memory_snapshot(self.device),

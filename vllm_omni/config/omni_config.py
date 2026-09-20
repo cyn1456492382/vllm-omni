@@ -474,6 +474,8 @@ class _DiffusionConfigProjection:
     lora_path: str | None = None
     lora_scale: float = 1.0
     max_cpu_loras: int | None = None
+    max_gpu_loras: int | None = None
+    enable_mixed_lora_batch: bool = False
     output_type: str = "pil"
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False

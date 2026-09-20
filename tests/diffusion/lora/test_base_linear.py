@@ -172,3 +172,153 @@ def test_diffusion_base_linear_apply_respects_inactive_slices():
     # Only the first slice should be adapted.
     expected = torch.tensor([[2.0, 4.0, 3.0]])
     assert torch.allclose(out, expected)
+
+
+def test_diffusion_base_linear_apply_multi_lora_ragged_rows(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "1")
+    monkeypatch.setenv("VLLM_OMNI_MULTI_LORA_IMPL", "torch")
+
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(
+        DiffusionBaseLinearLayerWithLoRA
+    )
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.eye(2))
+
+    a = torch.zeros((2, 1, 1, 2))
+    b = torch.zeros((2, 1, 2, 1))
+    a[0, 0, 0] = torch.tensor([1.0, 0.0])
+    b[0, 0, :, 0] = torch.tensor([1.0, 2.0])
+    a[1, 0, 0] = torch.tensor([0.0, 1.0])
+    b[1, 0, :, 0] = torch.tensor([3.0, 4.0])
+
+    layer.lora_a_stacked = (a,)
+    layer.lora_b_stacked = (b,)
+    layer.output_slices = (2,)
+    layer._diffusion_lora_active_slices = (True,)
+    layer.set_batch_adapter_composition(
+        (((0, 1.0),), ((1, 0.5),)),
+        row_layout=(3, 2),
+    )
+
+    x = torch.tensor(
+        [[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [0.0, 1.0], [0.0, 2.0]]
+    )
+    expected = x.clone()
+    expected[:3] += x[:3, :1] * torch.tensor([1.0, 2.0])
+    expected[3:] += x[3:, 1:2] * torch.tensor([1.5, 2.0])
+
+    assert torch.allclose(layer.apply(x), expected)
+
+
+def test_multi_lora_scale_and_operator_off_contract(monkeypatch):
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(
+        DiffusionBaseLinearLayerWithLoRA
+    )
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.eye(2))
+    a = torch.zeros((2, 1, 1, 2))
+    b = torch.zeros((2, 1, 2, 1))
+    a[0, 0, 0] = torch.tensor([1.0, 0.0])
+    b[0, 0, :, 0] = torch.tensor([1.0, 2.0])
+    a[1, 0, 0] = torch.tensor([0.0, 1.0])
+    b[1, 0, :, 0] = torch.tensor([3.0, 4.0])
+    layer.lora_a_stacked = (a,)
+    layer.lora_b_stacked = (b,)
+    layer.output_slices = (2,)
+    layer._diffusion_lora_active_slices = (True,)
+
+    x = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
+    layer.set_batch_adapter_composition(
+        (((0, 0.5), (1, -1.25)),), row_layout=(2,)
+    )
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "1")
+    monkeypatch.setenv("VLLM_OMNI_MULTI_LORA_IMPL", "torch")
+    expected = x.clone()
+    expected += 0.5 * x[:, :1] * torch.tensor([1.0, 2.0])
+    expected += -1.25 * x[:, 1:2] * torch.tensor([3.0, 4.0])
+    assert torch.allclose(layer.apply(x), expected)
+
+    monkeypatch.delenv("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR")
+    with pytest.raises(RuntimeError, match="K>1"):
+        layer.apply(x)
+
+
+def test_explicit_invalid_row_layout_is_not_silently_rebalanced(monkeypatch):
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(
+        DiffusionBaseLinearLayerWithLoRA
+    )
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.eye(2))
+    layer.lora_a_stacked = (torch.ones((1, 1, 1, 2)),)
+    layer.lora_b_stacked = (torch.ones((1, 1, 2, 1)),)
+    layer.output_slices = (2,)
+    layer._diffusion_lora_active_slices = (True,)
+    layer.set_batch_adapter_composition((((0, 1.0),), ((0, 1.0),)), row_layout=(1, 1))
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "1")
+    monkeypatch.setenv("VLLM_OMNI_MULTI_LORA_IMPL", "torch")
+    with pytest.raises(ValueError, match="row layout"):
+        layer.apply(torch.ones(3, 2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_diffusion_base_linear_tile_fused_caches_ragged_plan(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_ENABLE_MULTI_LORA_OPERATOR", "1")
+    monkeypatch.setenv("VLLM_OMNI_MULTI_LORA_IMPL", "tile_fused")
+
+    layer = DiffusionBaseLinearLayerWithLoRA.__new__(
+        DiffusionBaseLinearLayerWithLoRA
+    )
+    layer.tp_size = 1
+    layer.lora_config = _DummyLoRAConfig()
+    layer.base_layer = type("Base", (), {})()
+    layer.base_layer.quant_method = _DummyQuantMethod(torch.eye(4, 2, device="cuda"))
+    layer.output_slices = (2, 2)
+    layer._diffusion_lora_active_slices = (True, True)
+
+    a0 = torch.zeros((2, 1, 1, 2), device="cuda")
+    b0 = torch.zeros((2, 1, 2, 1), device="cuda")
+    a1 = torch.zeros((2, 1, 1, 2), device="cuda")
+    b1 = torch.zeros((2, 1, 2, 1), device="cuda")
+    a0[0, 0, 0] = torch.tensor([1.0, 0.0], device="cuda")
+    b0[0, 0, :, 0] = torch.tensor([1.0, 2.0], device="cuda")
+    a0[1, 0, 0] = torch.tensor([0.0, 1.0], device="cuda")
+    b0[1, 0, :, 0] = torch.tensor([3.0, 4.0], device="cuda")
+    a1[0, 0, 0] = torch.tensor([0.0, 1.0], device="cuda")
+    b1[0, 0, :, 0] = torch.tensor([5.0, 6.0], device="cuda")
+    a1[1, 0, 0] = torch.tensor([1.0, 0.0], device="cuda")
+    b1[1, 0, :, 0] = torch.tensor([7.0, 8.0], device="cuda")
+    layer.lora_a_stacked = (a0, a1)
+    layer.lora_b_stacked = (b0, b1)
+    layer._diffusion_lora_slot_ranks_by_slice = (
+        torch.tensor([1, 1], device="cuda", dtype=torch.int32),
+        torch.tensor([1, 1], device="cuda", dtype=torch.int32),
+    )
+    layer.set_batch_adapter_composition(
+        (((0, 1.0),), ((1, -0.5),)), row_layout=(3, 2)
+    )
+
+    x = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
+        device="cuda",
+    )
+    expected = x @ torch.eye(4, 2, device="cuda").T
+    expected[:3, :2] += x[:3, :1] * torch.tensor([1.0, 2.0], device="cuda")
+    expected[:3, 2:] += x[:3, 1:2] * torch.tensor([5.0, 6.0], device="cuda")
+    expected[3:, :2] += -0.5 * x[3:, 1:2] * torch.tensor(
+        [3.0, 4.0], device="cuda"
+    )
+    expected[3:, 2:] += -0.5 * x[3:, :1] * torch.tensor(
+        [7.0, 8.0], device="cuda"
+    )
+
+    actual = layer.apply(x)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert len(layer._diffusion_lora_tile_plan_cache) == 2
+    torch.testing.assert_close(layer.apply(x), expected, atol=2e-2, rtol=2e-2)
+    assert len(layer._diffusion_lora_tile_plan_cache) == 2

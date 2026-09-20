@@ -61,12 +61,22 @@ from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
 from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
-from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
+try:
+    from vllm.entrypoints.scale_out.token_in_token_out.serving import ServingTokens
+except ModuleNotFoundError:
+    from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
 # Keep a fallback for older/newer upstream layouts during rebase windows.
 from vllm.entrypoints.serve.instrumentator.basic import base
-from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
+try:
+    from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
+    _legacy_serving_tokenization = True
+except ImportError:
+    from vllm.entrypoints.serve.tokenize.serving import (
+        OpenAIServingTokenization as ServingTokenization,
+    )
+    _legacy_serving_tokenization = False
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     process_lora_modules,
@@ -1023,15 +1033,27 @@ async def omni_init_app_state(
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
     )
-    state.serving_tokenization = ServingTokenization(
-        state.openai_serving_models,
-        state.online_renderer,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        trust_request_chat_template=args.trust_request_chat_template,
-    )
+    if _legacy_serving_tokenization:
+        state.serving_tokenization = ServingTokenization(
+            state.openai_serving_models,
+            state.online_renderer,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            trust_request_chat_template=args.trust_request_chat_template,
+        )
+    else:
+        state.serving_tokenization = ServingTokenization(
+            engine_client,
+            state.openai_serving_models,
+            state.online_renderer,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            trust_request_chat_template=args.trust_request_chat_template,
+        )
     state.openai_serving_transcription = (
         OpenAIServingTranscription(
             engine_client,
