@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -34,6 +35,10 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,7 @@ class FluxPipeline(
     nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
 ):
     supports_request_batch = True
+    supports_step_execution: ClassVar[bool] = True
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
@@ -501,6 +507,202 @@ class FluxPipeline(
             )
             return False
         return True
+
+    def prepare_encode(
+        self,
+        state: "StepRequestState",
+        **kwargs: Any,
+    ) -> "StepRequestState":
+        """Prepare one Flux request for stateful denoising."""
+        del kwargs
+        sampling = state.sampling
+        prompt = state.prompt if isinstance(state.prompt, str) else (state.prompt or {}).get("prompt", "")
+        negative_prompt = None
+        if isinstance(state.prompt, dict):
+            negative_prompt = state.prompt.get("negative_prompt")
+
+        height = sampling.height or self.default_sample_size * self.vae_scale_factor
+        width = sampling.width or self.default_sample_size * self.vae_scale_factor
+        num_inference_steps = sampling.num_inference_steps or 28
+        guidance_scale = sampling.guidance_scale or 0.0
+        true_cfg_scale = sampling.true_cfg_scale or 1.0
+        num_images_per_prompt = sampling.num_outputs_per_prompt or 1
+        max_sequence_length = sampling.max_sequence_length or 512
+        prompt_embeds = None
+        pooled_prompt_embeds = None
+        negative_prompt_embeds = None
+        negative_pooled_prompt_embeds = None
+
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = {}
+        self._current_timestep = None
+        self._interrupt = False
+
+        has_neg_prompt = negative_prompt is not None
+        do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+
+        prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+        )
+        negative_text_ids = None
+        if do_true_cfg:
+            (
+                negative_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                negative_text_ids,
+            ) = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_2=None,
+                prompt_embeds=negative_prompt_embeds,
+                pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+            )
+
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, latent_image_ids = self.prepare_latents(
+            num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            self.device,
+            sampling.generator,
+            sampling.latents,
+        )
+        timesteps, _ = self.prepare_timesteps(
+            num_inference_steps,
+            sampling.sigmas,
+            latents.shape[1],
+        )
+        req_scheduler = copy.deepcopy(self.scheduler)
+        req_scheduler.set_begin_index(0)
+
+        guidance = None
+        if self.transformer.guidance_embeds:
+            guidance = torch.full([latents.shape[0]], guidance_scale, dtype=torch.float32, device=self.device)
+
+        state.prompt_embeds = prompt_embeds
+        state.negative_prompt_embeds = negative_prompt_embeds
+        state.latents = latents
+        state.timesteps = timesteps
+        state.step_index = 0
+        state.scheduler = req_scheduler
+        state.do_true_cfg = do_true_cfg
+        state.guidance = guidance
+        state.sampling.cfg_normalize = False
+        state.extra.update(
+            {
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "negative_pooled_prompt_embeds": negative_pooled_prompt_embeds,
+                "text_ids": text_ids,
+                "negative_text_ids": negative_text_ids,
+                "latent_image_ids": latent_image_ids,
+                "true_cfg_scale": true_cfg_scale,
+                "height": height,
+                "width": width,
+            }
+        )
+        return state
+
+    def denoise_step(
+        self,
+        input_batch: "InputBatch",
+        **kwargs: Any,
+    ) -> torch.Tensor | None:
+        """Run one Flux transformer denoising step."""
+        del kwargs
+        if self.interrupt:
+            return None
+        states = input_batch.states
+        if not states:
+            raise ValueError("Flux step execution requires at least one request state.")
+        first = states[0]
+        self._current_timestep = input_batch.timesteps[0]
+        self.transformer.do_true_cfg = input_batch.do_true_cfg
+        pooled_prompt_embeds = torch.cat([state.extra["pooled_prompt_embeds"] for state in states], dim=0)
+        negative_pooled_prompt_embeds = None
+        negative_text_ids = None
+        if input_batch.do_true_cfg:
+            negative_pooled_prompt_embeds = torch.cat(
+                [state.extra["negative_pooled_prompt_embeds"] for state in states], dim=0
+            )
+            negative_text_ids = first.extra["negative_text_ids"]
+        timestep = input_batch.timesteps
+        positive_kwargs = {
+            "hidden_states": input_batch.latents,
+            "timestep": timestep / 1000,
+            "guidance": input_batch.guidance,
+            "pooled_projections": pooled_prompt_embeds,
+            "encoder_hidden_states": input_batch.prompt_embeds,
+            "txt_ids": first.extra["text_ids"],
+            "img_ids": first.extra["latent_image_ids"],
+            "joint_attention_kwargs": self.joint_attention_kwargs,
+            "return_dict": False,
+        }
+        negative_kwargs = None
+        if input_batch.do_true_cfg:
+            negative_kwargs = {
+                "hidden_states": input_batch.latents,
+                "timestep": timestep / 1000,
+                "guidance": input_batch.guidance,
+                "pooled_projections": negative_pooled_prompt_embeds,
+                "encoder_hidden_states": input_batch.negative_prompt_embeds,
+                "txt_ids": negative_text_ids,
+                "img_ids": first.extra["latent_image_ids"],
+                "joint_attention_kwargs": self.joint_attention_kwargs,
+                "return_dict": False,
+            }
+        return self.predict_noise_maybe_with_cfg(
+            input_batch.do_true_cfg,
+            input_batch.true_cfg_scale,
+            positive_kwargs,
+            negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    def step_scheduler(
+        self,
+        state: "StepRequestState",
+        noise_pred: torch.Tensor,
+        **kwargs: Any,
+    ) -> None:
+        """Advance one Flux scheduler step."""
+        del kwargs
+        if self.interrupt:
+            return
+        state.latents = self.scheduler_step_maybe_with_cfg(
+            noise_pred,
+            state.current_timestep,
+            state.latents,
+            state.do_true_cfg,
+            per_request_scheduler=state.scheduler,
+        )
+        state.step_index += 1
+
+    def post_decode(
+        self,
+        state: "StepRequestState",
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Decode final Flux latents."""
+        del kwargs
+        self._current_timestep = None
+        output_type = state.sampling.output_type or "pil"
+        if output_type == "latent":
+            return DiffusionOutput(output=state.latents)
+        height = state.extra["height"]
+        width = state.extra["width"]
+        latents = self._unpack_latents(state.latents, height, width, self.vae_scale_factor)
+        latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+        image = self.vae.decode(latents, return_dict=False)[0]
+        return DiffusionOutput(output=image)
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         """Forward pass for flux."""

@@ -102,14 +102,24 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         )
         self._diffusion_lora_batch_row_layout = None
 
+    def _refresh_diffusion_lora_active_slices(self) -> None:
+        rank_tables = getattr(self, "_diffusion_lora_slot_ranks_by_slice", None)
+        if rank_tables is None:
+            return
+        self._diffusion_lora_active_slices = tuple(
+            any(int(rank) > 0 for rank in ranks) for ranks in rank_tables
+        )
+
     def reset_lora(self, index: int):
         super().reset_lora(index)
-        n_slices = getattr(self, "n_slices", 1)
-        self._diffusion_lora_active_slices = (False,) * int(n_slices)
         rank_tables = getattr(self, "_diffusion_lora_slot_ranks_by_slice", None)
         if rank_tables is not None:
             for ranks in rank_tables:
                 ranks[index] = 0
+            self._refresh_diffusion_lora_active_slices()
+        else:
+            n_slices = getattr(self, "n_slices", 1)
+            self._diffusion_lora_active_slices = (False,) * int(n_slices)
 
     def set_lora(
         self,
@@ -123,12 +133,6 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         if isinstance(lora_a, list) or isinstance(lora_b, list):
             assert isinstance(lora_a, list)
             assert isinstance(lora_b, list)
-            active_slices = []
-            for a_i, b_i in zip(lora_a[:n_slices], lora_b[:n_slices]):
-                active_slices.append(a_i is not None and b_i is not None)
-            if len(active_slices) < n_slices:
-                active_slices.extend([False] * (n_slices - len(active_slices)))
-            self._diffusion_lora_active_slices = tuple(active_slices)
             rank_tables = getattr(
                 self, "_diffusion_lora_slot_ranks_by_slice", None
             )
@@ -139,12 +143,12 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                     )
         else:
             # Single-slice layer.
-            self._diffusion_lora_active_slices = (True,)
             rank_tables = getattr(
                 self, "_diffusion_lora_slot_ranks_by_slice", None
             )
             if rank_tables is not None:
                 rank_tables[0][index] = int(lora_a.shape[0])
+        self._refresh_diffusion_lora_active_slices()
 
     def set_batch_slot_indices(self, slot_indices: tuple[int | None, ...]) -> None:
         """Set one active LoRA slot per logical request in the next forward."""
@@ -210,6 +214,31 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             raise ValueError("Multi-LoRA row counts must be non-negative")
         self._diffusion_lora_batch_row_layout = normalized
 
+    def _filter_composition_for_slice(
+        self,
+        composition: tuple[tuple[tuple[int, float], ...], ...],
+        slice_index: int,
+    ) -> tuple[tuple[tuple[int, float], ...], ...]:
+        """Drop adapters that do not target the current packed slice."""
+        rank_tables = getattr(self, "_diffusion_lora_slot_ranks_by_slice", None)
+        if rank_tables is None or slice_index >= len(rank_tables):
+            return composition
+        rank_table = rank_tables[slice_index]
+        filtered: list[tuple[tuple[int, float], ...]] = []
+        for request_index, entries in enumerate(composition):
+            request_entries: list[tuple[int, float]] = []
+            for slot, scale in entries:
+                slot = int(slot)
+                if slot < 0 or slot >= len(rank_table):
+                    raise ValueError(
+                        "Multi-LoRA slot exceeds slice rank metadata: "
+                        f"request={request_index}, slice={slice_index}, slot={slot}"
+                    )
+                if int(rank_table[slot]) > 0:
+                    request_entries.append((slot, float(scale)))
+            filtered.append(tuple(request_entries))
+        return tuple(filtered)
+
     def _get_batch_row_layout(
         self,
         x_flat: torch.Tensor,
@@ -249,11 +278,16 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 and not self._diffusion_lora_active_slices[slice_index]
             ):
                 continue
+            slice_composition = self._filter_composition_for_slice(
+                composition, slice_index
+            )
+            if not any(slice_composition):
+                continue
             a_stack = self.lora_a_stacked[slice_index]
             b_stack = self.lora_b_stacked[slice_index]
             registry: dict[int, MultiLoRAAdapter] = {}
             relation: list[list[int]] = []
-            for entries in composition:
+            for entries in slice_composition:
                 request_relation: list[int] = []
                 for slot, _scale in entries:
                     if slot >= a_stack.shape[0]:
@@ -270,7 +304,8 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                         )
                 relation.append(request_relation)
             request_scales = [
-                [scale for _slot, scale in entries] for entries in composition
+                [scale for _slot, scale in entries]
+                for entries in slice_composition
             ]
             plan = prepare_lora_batch(
                 module_identity=f"{module_name}[slice={slice_index}]",
@@ -316,6 +351,15 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                     if (
                         slice_index < len(self._diffusion_lora_active_slices)
                         and not self._diffusion_lora_active_slices[slice_index]
+                    ):
+                        output_offset += slice_size
+                        continue
+                    rank_tables = getattr(
+                        self, "_diffusion_lora_slot_ranks_by_slice", None
+                    )
+                    if (
+                        rank_tables is not None
+                        and int(rank_tables[slice_index][slot_index]) <= 0
                     ):
                         output_offset += slice_size
                         continue
@@ -368,12 +412,6 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             torch.arange(len(row_layout), device=x_flat.device),
             torch.tensor(row_layout, device=x_flat.device, dtype=torch.long),
         )
-        segment_rows = tuple(
-            (request_index, int(slot), float(scale))
-            for request_index, entries in enumerate(composition)
-            for slot, scale in entries
-        )
-
         shrink_calls = 0
         expand_calls = 0
         segment_count = 0
@@ -383,6 +421,16 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 and not self._diffusion_lora_active_slices[slice_index]
             ):
                 continue
+            slice_composition = self._filter_composition_for_slice(
+                composition, slice_index
+            )
+            if not any(slice_composition):
+                continue
+            segment_rows = tuple(
+                (request_index, int(slot), float(scale))
+                for request_index, entries in enumerate(slice_composition)
+                for slot, scale in entries
+            )
             a_stack = self.lora_a_stacked[slice_index]
             b_stack = self.lora_b_stacked[slice_index]
             if not a_stack.is_contiguous():
@@ -482,12 +530,6 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         )
         if rank_tables is None:
             raise RuntimeError("LoRA rank metadata was not initialized")
-        relations = tuple(
-            tuple(slot for slot, _ in entries) for entries in composition
-        )
-        scales = tuple(
-            tuple(scale for _, scale in entries) for entries in composition
-        )
         tile_plan_cache = getattr(self, "_diffusion_lora_tile_plan_cache", None)
         if tile_plan_cache is None:
             tile_plan_cache = {}
@@ -498,6 +540,19 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 and not self._diffusion_lora_active_slices[slice_index]
             ):
                 continue
+            slice_composition = self._filter_composition_for_slice(
+                composition, slice_index
+            )
+            if not any(slice_composition):
+                continue
+            relations = tuple(
+                tuple(slot for slot, _ in entries)
+                for entries in slice_composition
+            )
+            scales = tuple(
+                tuple(scale for _, scale in entries)
+                for entries in slice_composition
+            )
             output_start = sum(output_slices[:slice_index])
             output_view = y_flat[:, output_start : output_start + slice_size]
             if implementation == "tile_fused":
@@ -506,14 +561,18 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                 cache_key = (
                     slice_index,
                     row_layout,
-                    composition,
+                    relations,
+                    scales,
                     int(slice_size),
                     x_flat.device,
                     rank_signature,
                 )
-                tile_plan = tile_plan_cache.get(cache_key)
+                disable_plan_cache = os.environ.get(
+                    "VLLM_OMNI_DISABLE_TILE_PLAN_CACHE", ""
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                tile_plan = None if disable_plan_cache else tile_plan_cache.get(cache_key)
                 if tile_plan is None:
-                    if len(tile_plan_cache) >= 64:
+                    if not disable_plan_cache and len(tile_plan_cache) >= 64:
                         tile_plan_cache.clear()
                     tile_plan = build_multi_lora_tile_plan(
                         row_layout,
@@ -522,8 +581,12 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
                         rank_signature,
                         int(slice_size),
                         x_flat.device,
+                        tile_size=int(
+                            os.environ.get("VLLM_OMNI_MULTI_LORA_TILE_SIZE", "64")
+                        ),
                     )
-                    tile_plan_cache[cache_key] = tile_plan
+                    if not disable_plan_cache:
+                        tile_plan_cache[cache_key] = tile_plan
                 execute_tiled_fused_lora(
                     x_flat,
                     output_view,

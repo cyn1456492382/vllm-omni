@@ -306,7 +306,16 @@ class BaseScheduler(ABC):
         )
         return StepBatchSamplingParamsKey(
             lora_int_id=lora_int_id,
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            lora_scale=(
+                1.0
+                if getattr(self.od_config, "enable_mixed_lora_batch", False)
+                else sampling.lora_scale
+            ),
+            **{
+                name: getattr(sampling, name)
+                for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES
+                if name != "lora_scale"
+            },
         )
 
 
